@@ -1,0 +1,23 @@
+[package]
+name = "cashu-mint-nip74"
+version.workspace = true
+edition.workspace = true
+authors = ["CDK Developers"]
+description = "Cashu Mint NIP-74 implementation over Nostr"
+license.workspace = true
+homepage = "https://github.com/cashubtc/cdk"
+repository = "https://github.com/cashubtc/cdk.git"
+
+[dependencies]
+nostr = { path = "../../../nostr/crates/nostr", features = ["std", "nip44"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+cashu = { path = "../cashu", version = "=0.11.0" }
+
+[features]
+# For possible future extensions
+default = [] 
