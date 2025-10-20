@@ -15,10 +15,17 @@ use crate::nuts::{
 use crate::wallet::AuthWallet;
 
 mod http_client;
+#[cfg(feature = "tor")]
+mod http_client_tor;
 
 #[cfg(feature = "auth")]
 pub use http_client::AuthHttpClient;
 pub use http_client::HttpClient;
+#[cfg(feature = "tor")]
+pub use http_client_tor::{
+    TorPolicy, TorConfig, HttpClientTor,
+    set_tor_config, get_tor_config, should_use_tor_for_url
+};
 
 /// Interface that connects a wallet to a mint. Typically represents an [HttpClient].
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]

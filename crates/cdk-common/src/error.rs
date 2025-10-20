@@ -269,6 +269,9 @@ pub enum Error {
     /// Http transport error
     #[error("Http transport error: {0}")]
     HttpError(String),
+    /// Tor transport error
+    #[error("Tor transport error: {0}")]
+    TorError(String),
     #[cfg(feature = "wallet")]
     // Crate error conversions
     /// Cashu Url Error
