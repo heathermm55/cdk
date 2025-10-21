@@ -275,7 +275,19 @@ impl Wallet {
 
         // Include token memo
         let send_memo = send.options.memo.or(memo);
-        let memo = send_memo.and_then(|m| if m.include_memo { Some(m.memo) } else { None });
+        let memo = send_memo.and_then(|m| if m.include_memo { Some(m.memo) } else { None });                                                                    
+
+        // Create token first so we can include it in transaction metadata
+        let token = Token::new(
+            self.mint_url.clone(),
+            proofs_to_send.clone(),
+            memo.clone(),
+            self.unit.clone(),
+        );
+        
+        // Add token string to metadata
+        let mut metadata = send.options.metadata;
+        metadata.insert("ecash_token".to_string(), token.to_string());
 
         // Add transaction to store
         self.localstore
@@ -288,17 +300,12 @@ impl Wallet {
                 ys: proofs_to_send.ys()?,
                 timestamp: unix_time(),
                 memo: memo.clone(),
-                metadata: send.options.metadata,
+                metadata,
             })
             .await?;
 
-        // Create and return token
-        Ok(Token::new(
-            self.mint_url.clone(),
-            proofs_to_send,
-            memo,
-            self.unit.clone(),
-        ))
+        // Return token
+        Ok(token)
     }
 
     /// Cancel prepared send

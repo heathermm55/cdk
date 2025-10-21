@@ -218,15 +218,19 @@ impl HttpClientTor {
         mint_url: MintUrl,
         #[cfg(feature = "auth")]
         auth_wallet: Option<AuthWallet>,
-    ) -> Self {
-        let http_client = HttpClient::new(mint_url.clone(), auth_wallet.clone());
+    ) -> Result<Self, Error> {
+        #[cfg(feature = "auth")]
+        let http_client = HttpClient::new(mint_url.clone(), auth_wallet.clone())?;
         
-        Self {
+        #[cfg(not(feature = "auth"))]
+        let http_client = HttpClient::new(mint_url.clone())?;
+        
+        Ok(Self {
             http_client,
             mint_url,
             #[cfg(feature = "auth")]
             auth_wallet: Arc::new(RwLock::new(auth_wallet)),
-        }
+        })
     }
 
     /// Check if Tor should be used for this mint URL

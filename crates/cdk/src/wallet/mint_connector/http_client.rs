@@ -27,21 +27,79 @@ use crate::nuts::{
 #[cfg(feature = "auth")]
 use crate::wallet::auth::{AuthMintConnector, AuthWallet};
 
+/// Check if the URL is a local network address
+fn is_local_network(mint_url: &MintUrl) -> bool {
+    let url_str = mint_url.to_string();
+    
+    // Check for localhost
+    if url_str.contains("localhost") || url_str.contains("127.0.0.1") {
+        return true;
+    }
+    
+    // Check for private IP ranges
+    // Extract host from URL string
+    if let Some(host_part) = url_str.split("://").nth(1) {
+        let host = host_part.split(':').next().unwrap_or(host_part).split('/').next().unwrap_or(host_part);
+        
+        // Try to parse as IP address
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            match ip {
+                std::net::IpAddr::V4(ipv4) => {
+                    let octets = ipv4.octets();
+                    // 192.168.x.x
+                    if octets[0] == 192 && octets[1] == 168 {
+                        return true;
+                    }
+                    // 10.x.x.x
+                    if octets[0] == 10 {
+                        return true;
+                    }
+                    // 172.16.x.x to 172.31.x.x
+                    if octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31 {
+                        return true;
+                    }
+                }
+                std::net::IpAddr::V6(ipv6) => {
+                    // Check for IPv6 localhost
+                    if ipv6.is_loopback() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    
+    false
+}
+
 #[derive(Debug, Clone)]
 struct HttpClientCore {
     inner: Client,
 }
 
 impl HttpClientCore {
-    fn new() -> Self {
+    fn new(mint_url: &MintUrl) -> Result<Self, Error> {
         #[cfg(not(target_arch = "wasm32"))]
         if rustls::crypto::CryptoProvider::get_default().is_none() {
             let _ = rustls::crypto::ring::default_provider().install_default();
         }
 
-        Self {
-            inner: Client::new(),
-        }
+        // Check if this is a local network address
+        let is_local = is_local_network(mint_url);
+        
+        let client = if is_local {
+            // For local network addresses, accept invalid certificates
+            tracing::debug!("Local network address detected ({}), accepting invalid certificates", mint_url);
+            Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .map_err(|e| Error::HttpError(e.to_string()))?
+        } else {
+            // For public addresses, use normal certificate verification
+            Client::new()
+        };
+
+        Ok(Self { inner: client })
     }
 
     fn client(&self) -> &Client {
@@ -118,21 +176,23 @@ pub struct HttpClient {
 impl HttpClient {
     /// Create new [`HttpClient`]
     #[cfg(feature = "auth")]
-    pub fn new(mint_url: MintUrl, auth_wallet: Option<AuthWallet>) -> Self {
-        Self {
-            core: HttpClientCore::new(),
+    pub fn new(mint_url: MintUrl, auth_wallet: Option<AuthWallet>) -> Result<Self, Error> {
+        let core = HttpClientCore::new(&mint_url)?;
+        Ok(Self {
+            core,
             mint_url,
             auth_wallet: Arc::new(RwLock::new(auth_wallet)),
-        }
+        })
     }
 
     #[cfg(not(feature = "auth"))]
     /// Create new [`HttpClient`]
-    pub fn new(mint_url: MintUrl) -> Self {
-        Self {
-            core: HttpClientCore::new(),
+    pub fn new(mint_url: MintUrl) -> Result<Self, Error> {
+        let core = HttpClientCore::new(&mint_url)?;
+        Ok(Self {
+            core,
             mint_url,
-        }
+        })
     }
 
     /// Get auth token for a protected endpoint
@@ -409,14 +469,15 @@ pub struct AuthHttpClient {
 #[cfg(feature = "auth")]
 impl AuthHttpClient {
     /// Create new [`AuthHttpClient`]
-    pub fn new(mint_url: MintUrl, cat: Option<AuthToken>) -> Self {
-        Self {
-            core: HttpClientCore::new(),
+    pub fn new(mint_url: MintUrl, cat: Option<AuthToken>) -> Result<Self, Error> {
+        let core = HttpClientCore::new(&mint_url)?;
+        Ok(Self {
+            core,
             mint_url,
             cat: Arc::new(RwLock::new(
                 cat.unwrap_or(AuthToken::ClearAuth("".to_string())),
             )),
-        }
+        })
     }
 }
 

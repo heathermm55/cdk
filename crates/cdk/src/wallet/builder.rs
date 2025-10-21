@@ -100,15 +100,15 @@ impl WalletBuilder {
 
     /// Set auth CAT (Clear Auth Token)
     #[cfg(feature = "auth")]
-    pub fn set_auth_cat(mut self, cat: String) -> Self {
+    pub fn set_auth_cat(mut self, cat: String) -> Result<Self, Error> {
         self.auth_wallet = Some(AuthWallet::new(
-            self.mint_url.clone().expect("Mint URL required"),
+            self.mint_url.clone().ok_or(Error::Custom("Mint URL required".to_string()))?,
             Some(AuthToken::ClearAuth(cat)),
-            self.localstore.clone().expect("Localstore required"),
+            self.localstore.clone().ok_or(Error::Custom("Localstore required".to_string()))?,
             HashMap::new(),
             None,
-        ));
-        self
+        )?);
+        Ok(self)
     }
 
     /// Build the wallet
@@ -134,13 +134,13 @@ impl WalletBuilder {
             None => {
                 #[cfg(feature = "auth")]
                 {
-                    Arc::new(HttpClient::new(mint_url.clone(), self.auth_wallet.clone()))
+                    Arc::new(HttpClient::new(mint_url.clone(), self.auth_wallet.clone())?)
                         as Arc<dyn MintConnector + Send + Sync>
                 }
 
                 #[cfg(not(feature = "auth"))]
                 {
-                    Arc::new(HttpClient::new(mint_url.clone()))
+                    Arc::new(HttpClient::new(mint_url.clone())?)
                         as Arc<dyn MintConnector + Send + Sync>
                 }
             }

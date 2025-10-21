@@ -286,7 +286,7 @@ impl Wallet {
                                 self.localstore.clone(),
                                 mint_info.protected_endpoints(),
                                 oidc_client,
-                            );
+                            )?;
                             *auth_wallet = Some(new_auth_wallet.clone());
 
                             self.client.set_auth_wallet(Some(new_auth_wallet)).await;

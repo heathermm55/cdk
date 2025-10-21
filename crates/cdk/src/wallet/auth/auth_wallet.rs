@@ -56,16 +56,16 @@ impl AuthWallet {
         localstore: Arc<dyn WalletDatabase<Err = database::Error> + Send + Sync>,
         protected_endpoints: HashMap<ProtectedEndpoint, AuthRequired>,
         oidc_client: Option<OidcClient>,
-    ) -> Self {
-        let http_client = Arc::new(AuthHttpClient::new(mint_url.clone(), cat));
-        Self {
+    ) -> Result<Self, Error> {
+        let http_client = Arc::new(AuthHttpClient::new(mint_url.clone(), cat)?);
+        Ok(Self {
             mint_url,
             localstore,
             protected_endpoints: Arc::new(RwLock::new(protected_endpoints)),
             refresh_token: Arc::new(RwLock::new(None)),
             client: http_client,
             oidc_client: Arc::new(RwLock::new(oidc_client)),
-        }
+        })
     }
 
     /// Get the current auth token

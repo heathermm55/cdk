@@ -292,6 +292,13 @@ impl Wallet {
         self.localstore.update_proofs(proof_infos, vec![]).await?;
 
         // Add transaction to store
+        let mut metadata = HashMap::new();
+        metadata.insert("transaction_type".to_string(), "lightning_receive".to_string());
+        // Store the lightning invoice from the quote
+        metadata.insert("lightning_invoice".to_string(), quote_info.request.clone());
+        // Store the quote ID for reference
+        metadata.insert("quote_id".to_string(), quote_info.id.clone());
+        
         self.localstore
             .add_transaction(Transaction {
                 mint_url: self.mint_url.clone(),
@@ -302,7 +309,7 @@ impl Wallet {
                 ys: proofs.ys()?,
                 timestamp: unix_time,
                 memo: None,
-                metadata: HashMap::new(),
+                metadata,
             })
             .await?;
 
