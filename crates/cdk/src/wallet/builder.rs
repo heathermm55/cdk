@@ -16,7 +16,11 @@ use crate::mint_url::MintUrl;
 use crate::nuts::CurrencyUnit;
 #[cfg(feature = "auth")]
 use crate::wallet::auth::AuthWallet;
-use crate::wallet::{HttpClient, MintConnector, SubscriptionManager, Wallet};
+use crate::wallet::{MintConnector, SubscriptionManager, Wallet};
+#[cfg(not(feature = "tor"))]
+use crate::wallet::HttpClient;
+#[cfg(feature = "tor")]
+use crate::wallet::mint_connector::HttpClientTor;
 
 /// Builder for creating a new [`Wallet`]
 #[derive(Debug)]
@@ -132,14 +136,44 @@ impl WalletBuilder {
         let client = match self.client {
             Some(client) => client,
             None => {
-                #[cfg(feature = "auth")]
+                let url_str = mint_url.to_string();
+                #[allow(unused_variables)]
+                let is_onion = url_str.contains(".onion");
+                
+                tracing::info!("WalletBuilder: mint_url={}, is_onion={}", url_str, is_onion);
+                
+                // Feature combination: tor + auth
+                // Always use HttpClientTor to support dynamic Tor policy changes
+                #[cfg(all(feature = "tor", feature = "auth"))]
                 {
+                    tracing::info!("WalletBuilder: Creating HttpClientTor (with auth) for {} - supports dynamic Tor policy", url_str);
+                    Arc::new(HttpClientTor::new(mint_url.clone(), self.auth_wallet.clone())?)
+                        as Arc<dyn MintConnector + Send + Sync>
+                }
+                
+                // Feature combination: tor + no auth
+                // Always use HttpClientTor to support dynamic Tor policy changes
+                #[cfg(all(feature = "tor", not(feature = "auth")))]
+                {
+                    tracing::info!("WalletBuilder: Creating HttpClientTor (no auth) for {} - supports dynamic Tor policy", url_str);
+                    Arc::new(HttpClientTor::new(mint_url.clone())?)
+                        as Arc<dyn MintConnector + Send + Sync>
+                }
+                
+                // Feature combination: no tor + auth
+                #[cfg(all(not(feature = "tor"), feature = "auth"))]
+                {
+                    tracing::info!("WalletBuilder: Using no-tor+auth branch");
+                    // This will fail for .onion addresses with a clear error message
                     Arc::new(HttpClient::new(mint_url.clone(), self.auth_wallet.clone())?)
                         as Arc<dyn MintConnector + Send + Sync>
                 }
-
-                #[cfg(not(feature = "auth"))]
+                
+                // Feature combination: no tor + no auth
+                #[cfg(all(not(feature = "tor"), not(feature = "auth")))]
                 {
+                    tracing::info!("WalletBuilder: Using no-tor+no-auth branch");
+                    // This will fail for .onion addresses with a clear error message
                     Arc::new(HttpClient::new(mint_url.clone())?)
                         as Arc<dyn MintConnector + Send + Sync>
                 }

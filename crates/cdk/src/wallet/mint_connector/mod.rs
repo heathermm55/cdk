@@ -24,7 +24,7 @@ pub use http_client::HttpClient;
 #[cfg(feature = "tor")]
 pub use http_client_tor::{
     TorPolicy, TorConfig, HttpClientTor,
-    set_tor_config, get_tor_config, should_use_tor_for_url
+    set_tor_config, get_tor_config, should_use_tor_for_url, is_tor_ready
 };
 
 /// Interface that connects a wallet to a mint. Typically represents an [HttpClient].

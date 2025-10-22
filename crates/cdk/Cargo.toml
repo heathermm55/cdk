@@ -17,9 +17,10 @@ mint = ["dep:futures", "dep:reqwest", "cdk-common/mint", "cdk-signatory"]
 auth = ["dep:jsonwebtoken", "cdk-common/auth", "cdk-common/auth"]
 # Enable Tor-based smart connector (optional)
 tor = [
-    "dep:arti-ureq",
     "dep:arti-client",
-    "dep:ureq",
+    "dep:arti",
+    "dep:tor-rtcompat",
+    "dep:tor-config",
     "dep:lazy_static",
 ]
 # We do not commit to a MSRV with swagger enabled
@@ -50,10 +51,11 @@ uuid.workspace = true
 jsonwebtoken = { workspace = true, optional = true }
 
 # Optional Tor dependencies (path to local arti workspace)
-arti-ureq = { path = "../../../arti/crates/arti-ureq", optional = true, default-features = false, features = ["tokio", "native-tls"] }
-arti-client = { path = "../../../arti/crates/arti-client", optional = true, default-features = false, features = ["tokio", "native-tls"] }
+arti-client = { path = "../../../arti/crates/arti-client", optional = true, default-features = false, features = ["tokio", "native-tls", "bridge-client", "pt-client", "onion-service-client"] }
+arti = { path = "../../../arti/crates/arti", optional = true, default-features = false, features = ["tokio", "native-tls", "experimental-api"] }
+tor-rtcompat = { path = "../../../arti/crates/tor-rtcompat", optional = true, default-features = false, features = ["tokio", "native-tls"] }
+tor-config = { path = "../../../arti/crates/tor-config", optional = true }
 # Additional dependencies for Tor support
-ureq = { version = "3.0", optional = true, features = ["json"] }
 lazy_static = { version = "1.5", optional = true }
 
 # -Z minimal-versions
@@ -107,9 +109,9 @@ required-features = ["wallet"]
 name = "auth_wallet"
 required-features = ["wallet", "auth"]
 
-[[example]]
-name = "tor_wallet"
-required-features = ["wallet", "tor"]
+# [[example]]
+# name = "tor_wallet"
+# required-features = ["wallet", "tor"]
 
 [dev-dependencies]
 rand.workspace = true

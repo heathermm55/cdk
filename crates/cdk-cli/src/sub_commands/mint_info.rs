@@ -12,9 +12,9 @@ pub struct MintInfoSubcommand {
 
 pub async fn mint_info(proxy: Option<Url>, sub_command_args: &MintInfoSubcommand) -> Result<()> {
     let mint_url = sub_command_args.mint_url.clone();
-    let client = match proxy {
+    let client: HttpClient = match proxy {
         Some(proxy) => HttpClient::with_proxy(mint_url, proxy, None, true)?,
-        None => HttpClient::new(mint_url, None),
+        None => HttpClient::new(mint_url, None)?,
     };
 
     let info = client.get_mint_info().await?;

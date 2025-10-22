@@ -55,7 +55,7 @@ pub use cdk_common::wallet as types;
 pub use mint_connector::AuthHttpClient;
 pub use mint_connector::{HttpClient, MintConnector};
 #[cfg(feature = "tor")]
-pub use mint_connector::{TorPolicy, TorConfig, HttpClientTor, set_tor_config, get_tor_config, should_use_tor_for_url};
+pub use mint_connector::{TorPolicy, TorConfig, HttpClientTor, set_tor_config, get_tor_config, should_use_tor_for_url, is_tor_ready};
 pub use multi_mint_wallet::MultiMintWallet;
 pub use receive::ReceiveOptions;
 pub use send::{PreparedSend, SendMemo, SendOptions};

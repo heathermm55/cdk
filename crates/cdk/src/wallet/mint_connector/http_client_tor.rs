@@ -1,4 +1,4 @@
-//! HTTP client with Tor support using global configuration
+//! HTTP client with Tor support using SOCKS proxy
 
 #[cfg(feature = "tor")]
 use std::sync::{Arc, RwLock};
@@ -6,18 +6,18 @@ use std::sync::{Arc, RwLock};
 #[cfg(feature = "tor")]
 use arti_client::{TorClient, TorClientConfig};
 #[cfg(feature = "tor")]
-use arti_ureq::Connector as ArtiUreqConnector;
+use tor_rtcompat::PreferredRuntime;
 #[cfg(feature = "tor")]
-use arti_ureq::tor_rtcompat::PreferredRuntime;
+use tor_config::Listen;
 #[cfg(feature = "tor")]
 use async_trait::async_trait;
 #[cfg(feature = "tor")]
-use ureq::Agent;
+use tokio::task::JoinHandle;
 
 use super::Error;
 use crate::mint_url::MintUrl;
 use crate::nuts::{
-    CheckStateRequest, CheckStateResponse, Id, KeySet, KeysetResponse, MeltQuoteBolt11Request,
+    CheckStateRequest, CheckStateResponse, Id, KeySet, KeysResponse, KeysetResponse, MeltQuoteBolt11Request,
     MeltQuoteBolt11Response, MeltRequest, MintInfo, MintQuoteBolt11Request,
     MintQuoteBolt11Response, MintRequest, MintResponse, RestoreRequest, RestoreResponse,
     SwapRequest, SwapResponse,
@@ -49,14 +49,23 @@ pub struct TorConfig {
     pub client_config: Option<TorClientConfig>,
     /// Whether to accept invalid certificates
     pub accept_invalid_certs: bool,
+    /// Cache directory for Tor (optional, defaults to in-memory if not provided)
+    pub cache_dir: Option<String>,
+    /// State directory for Tor (optional, defaults to in-memory if not provided)
+    pub state_dir: Option<String>,
+    /// Tor bridges (optional, for censored networks)
+    /// Format: "obfs4 IP:PORT FINGERPRINT cert=CERT iat-mode=0"
+    pub bridges: Option<Vec<String>>,
 }
 
-/// Tor manager - singleton instance
+/// Tor manager - singleton instance  
 #[cfg(feature = "tor")]
 pub struct TorManager {
     config: Arc<RwLock<Option<TorConfig>>>,
     tor_client: Arc<RwLock<Option<TorClient<PreferredRuntime>>>>,
-    tor_agent: Arc<RwLock<Option<Agent>>>,
+    socks_proxy: Arc<RwLock<Option<JoinHandle<anyhow::Result<()>>>>>,
+    socks_port: Arc<RwLock<Option<u16>>>,
+    tor_http_client: Arc<RwLock<Option<Arc<reqwest::Client>>>>,
 }
 
 #[cfg(feature = "tor")]
@@ -66,7 +75,9 @@ impl TorManager {
         Self {
             config: Arc::new(RwLock::new(None)),
             tor_client: Arc::new(RwLock::new(None)),
-            tor_agent: Arc::new(RwLock::new(None)),
+            socks_proxy: Arc::new(RwLock::new(None)),
+            socks_port: Arc::new(RwLock::new(None)),
+            tor_http_client: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -93,49 +104,248 @@ impl TorManager {
 
     /// Check if Tor should be used for a given URL
     pub fn should_use_tor(&self, url: &MintUrl) -> bool {
+        let url_str = url.to_string();
+        let is_onion = url_str.contains(".onion");
+        
         let config_guard = self.config.read().unwrap();
-        match config_guard.as_ref() {
-            Some(config) => match config.policy {
-                TorPolicy::Never => false,
-                TorPolicy::OnionOnly => url.to_string().ends_with(".onion"),
-                TorPolicy::Always => true,
+        let result = match config_guard.as_ref() {
+            Some(config) => {
+                tracing::info!(
+                    "TorManager::should_use_tor: url={}, is_onion={}, policy={:?}",
+                    url_str, is_onion, config.policy
+                );
+                match config.policy {
+                    TorPolicy::Never => false,
+                    TorPolicy::OnionOnly => is_onion,
+                    TorPolicy::Always => true,
+                }
             },
-            None => false,
-        }
+            // Default behavior: use Tor for .onion addresses even without explicit config
+            None => {
+                tracing::warn!(
+                    "TorManager::should_use_tor: url={}, is_onion={}, NO CONFIG SET (defaulting to onion-only)",
+                    url_str, is_onion
+                );
+                is_onion
+            }
+        };
+        
+        tracing::info!("TorManager::should_use_tor: result={}", result);
+        result
     }
 
-    /// Get Tor agent for making requests
-    pub async fn get_tor_agent(&self) -> Result<Option<Agent>, Error> {
-        let agent_guard = self.tor_agent.read().unwrap();
-        Ok(agent_guard.clone())
+    /// Get Tor HTTP client for making requests
+    /// Creates client lazily with SOCKS proxy configuration
+    pub async fn get_tor_http_client(&self) -> Result<Option<Arc<reqwest::Client>>, Error> {
+        // Check if client already exists
+        {
+            let client_guard = self.tor_http_client.read().unwrap();
+            if client_guard.is_some() {
+                tracing::info!("Reusing existing Tor HTTP client with SOCKS proxy");
+                return Ok(client_guard.clone());
+            }
+        }
+        
+        // Get SOCKS port
+        let socks_port = {
+            let port_guard = self.socks_port.read().unwrap();
+            *port_guard
+        };
+        
+        if let Some(port) = socks_port {
+            tracing::info!("Creating Tor HTTP client with SOCKS proxy on port {}", port);
+            
+            // Build reqwest client with SOCKS proxy
+            // Timeouts must be longer than Arti's internal timeouts to allow full descriptor fetch
+            let proxy_url = format!("socks5h://127.0.0.1:{}", port);  // socks5h = DNS through proxy
+            let http_client = reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all(&proxy_url)
+                    .map_err(|e| Error::TorError(format!("Failed to create SOCKS proxy: {}", e)))?)
+                .timeout(std::time::Duration::from_secs(300))  // 6 minutes total (longer than Arti's 5 min)
+                .connect_timeout(std::time::Duration::from_secs(120))  // 2 minutes to connect via bridge
+                .build()
+                .map_err(|e| Error::TorError(format!("Failed to build reqwest client: {}", e)))?;
+            
+            let http_client = Arc::new(http_client);
+            tracing::info!("Tor HTTP client with SOCKS proxy created successfully");
+            
+            // Cache it
+            {
+                let mut client_guard = self.tor_http_client.write().unwrap();
+                *client_guard = Some(http_client.clone());
+            }
+            
+            Ok(Some(http_client))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Initialize Tor client
     async fn initialize_tor_client(&self, config: &TorConfig) -> Result<(), Error> {
-        let tor_config = config.client_config.clone().unwrap_or_default();
+        use arti_client::config::CfgPath;
         
-        // Create Tor client
-        let tor_client = TorClient::create_bootstrapped(tor_config).await
+        let tor_config = if let Some(cfg) = &config.client_config {
+            cfg.clone()
+        } else {
+            // Build config with custom storage paths if provided
+            let mut builder = TorClientConfig::builder();
+            
+            // Configure storage paths if provided
+            if let Some(cache_dir) = &config.cache_dir {
+                tracing::info!("Using Tor cache directory: {}", cache_dir);
+                builder.storage()
+                    .cache_dir(CfgPath::new(cache_dir.clone()));
+            }
+            
+            if let Some(state_dir) = &config.state_dir {
+                tracing::info!("Using Tor state directory: {}", state_dir);
+                builder.storage()
+                    .state_dir(CfgPath::new(state_dir.clone()));
+            }
+            
+            // Configure bridges if provided (for censored networks)
+            if let Some(bridges) = &config.bridges {
+                if !bridges.is_empty() {
+                    use std::str::FromStr;
+                    use arti_client::config::pt::TransportConfigBuilder;
+                    
+                    tracing::info!("Configuring {} Tor bridges for censored network", bridges.len());
+                    
+                    let mut bridge_builders = Vec::new();
+                    let mut needs_obfs4 = false;
+                    
+                    for (idx, bridge_line) in bridges.iter().enumerate() {
+                        tracing::info!("Bridge {}: {}", idx + 1, bridge_line);
+                        
+                        // Check if this is an obfs4 bridge
+                        if bridge_line.starts_with("obfs4 ") {
+                            needs_obfs4 = true;
+                        }
+                        
+                        // Parse bridge line using FromStr (requires bridge-client feature in arti-client)
+                        match arti_client::config::BridgeConfigBuilder::from_str(bridge_line) {
+                            Ok(bridge_builder) => {
+                                tracing::info!("Successfully parsed bridge {}", idx + 1);
+                                bridge_builders.push(bridge_builder);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to parse bridge {} '{}': {}", idx + 1, bridge_line, e);
+                            }
+                        }
+                    }
+                    
+                    // Add parsed bridges to config
+                    if !bridge_builders.is_empty() {
+                        tracing::info!("Adding {} valid bridges to Tor configuration", bridge_builders.len());
+                        *builder.bridges().bridges() = bridge_builders;
+                        
+                        // Configure obfs4 transport if needed
+                        if needs_obfs4 {
+                            tracing::info!("Configuring obfs4 pluggable transport");
+                            let mut transport = TransportConfigBuilder::default();
+                            
+                            // Parse protocol name
+                            match "obfs4".parse() {
+                                Ok(protocol) => {
+                                    transport.protocols(vec![protocol]);
+                                    
+                                    // Set path to obfs4proxy binary
+                                    // Note: On Android, this might need to be bundled with the app
+                                    // For now, we'll try common paths
+                                    transport.path(CfgPath::new("obfs4proxy".into()));
+                                    transport.run_on_startup(true);
+                                    
+                                    builder.bridges().transports().push(transport);
+                                    tracing::info!("obfs4 transport configured successfully");
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to parse obfs4 protocol: {}", e);
+                                }
+                            }
+                        }
+                    } else {
+                        tracing::warn!("No valid bridges could be parsed");
+                    }
+                }
+            }
+            
+            // Configure aggressive timeouts for hidden service connections
+            // These are especially important when using bridges with high latency
+            tracing::info!("Configuring extended timeouts for hidden service connections via bridges");
+            use std::time::Duration;
+            
+            builder.circuit_timing()
+                .request_timeout(Duration::from_secs(250))  // 5 minutes for circuit requests (bridges are slow)
+                .hs_desc_fetch_attempts(20)  // Many more attempts for descriptor fetch
+                .hs_intro_rend_attempts(20)  // Many more attempts for intro/rendezvous
+                .max_dirtiness(Duration::from_secs(3600));  // Keep circuits alive longer (1 hour)
+            
+            // Aggressive stream timeouts for high-latency bridge connections
+            builder.stream_timeouts()
+                .connect_timeout(Duration::from_secs(60))  // 1 minute for stream connect
+                .resolve_timeout(Duration::from_secs(60))  // 1 minute for DNS resolve
+                .resolve_ptr_timeout(Duration::from_secs(60));  // 1 minute for PTR resolve
+            
+            // Configure download schedule for better reliability with bridges
+            builder.download_schedule()
+                .retry_bootstrap()
+                .attempts(100)  // More bootstrap retry attempts
+                .initial_delay(Duration::from_secs(5))
+                .parallelism(4);  // More parallel requests
+            
+            // Build the config
+            builder.build()
+                .map_err(|e| Error::TorError(format!("Failed to build Tor config: {}", e)))?
+        };
+        
+        tracing::info!("Attempting to bootstrap Tor client...");
+        
+        // Create Tor client (uses current Tokio runtime from Flutter Rust Bridge)
+        let tor_client = TorClient::create_bootstrapped(tor_config)
+            .await
             .map_err(|e| Error::TorError(format!("Failed to create Tor client: {}", e)))?;
 
-        // Create arti-ureq connector and get agent
-        let connector = ArtiUreqConnector::<PreferredRuntime>::builder()
-            .map_err(|e| Error::TorError(format!("Failed to create connector builder: {}", e)))?
-            .tor_client(tor_client.clone())
-            .build()
-            .map_err(|e| Error::TorError(format!("Failed to build connector: {}", e)))?;
-        
-        let tor_agent = connector.agent();
+        tracing::info!("Tor client bootstrapped successfully");
 
-        // Store client and agent
+        // Start SOCKS proxy on a random available port
+        use std::net::{TcpListener, SocketAddr};
+        let temp_listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| Error::TorError(format!("Failed to find available port: {}", e)))?;
+        let socks_addr: SocketAddr = temp_listener.local_addr()
+            .map_err(|e| Error::TorError(format!("Failed to get local address: {}", e)))?;
+        let socks_port = socks_addr.port();
+        drop(temp_listener); // Release the port
+        
+        tracing::info!("Starting SOCKS proxy on port {}", socks_port);
+        
+        // Start SOCKS proxy server (using arti's experimental API)
+        let client_clone = tor_client.clone();
+        let runtime_clone = tor_client.runtime().clone();
+        let proxy_handle = tokio::spawn(arti::socks::run_socks_proxy(
+            runtime_clone,
+            client_clone,
+            Listen::new_localhost(socks_port),
+            None,
+        ));
+        
+        tracing::info!("SOCKS proxy started successfully on port {}", socks_port);
+
+        // Store TorClient, proxy handle, and SOCKS port
         {
             let mut client_guard = self.tor_client.write().unwrap();
             *client_guard = Some(tor_client);
         }
         {
-            let mut agent_guard = self.tor_agent.write().unwrap();
-            *agent_guard = Some(tor_agent);
+            let mut proxy_guard = self.socks_proxy.write().unwrap();
+            *proxy_guard = Some(proxy_handle);
         }
+        {
+            let mut port_guard = self.socks_port.write().unwrap();
+            *port_guard = Some(socks_port);
+        }
+
+        tracing::info!("Tor client and SOCKS proxy initialized successfully");
 
         Ok(())
     }
@@ -172,10 +382,17 @@ pub fn should_use_tor_for_url(url: &MintUrl) -> bool {
     TOR_MANAGER.should_use_tor(url)
 }
 
-/// Get Tor agent for making requests
+/// Get Tor HTTP client for making requests
 #[cfg(feature = "tor")]
-pub async fn get_tor_agent() -> Result<Option<Agent>, Error> {
-    TOR_MANAGER.get_tor_agent().await
+pub async fn get_tor_http_client() -> Result<Option<Arc<reqwest::Client>>, Error> {
+    TOR_MANAGER.get_tor_http_client().await
+}
+
+/// Check if Tor is ready (HTTP client initialized)
+#[cfg(feature = "tor")]
+pub async fn is_tor_ready() -> Result<bool, Error> {
+    let client = TOR_MANAGER.get_tor_http_client().await?;
+    Ok(client.is_some())
 }
 
 // Non-Tor implementations (when feature is disabled)
@@ -195,7 +412,7 @@ pub fn should_use_tor_for_url(_url: &MintUrl) -> bool {
 }
 
 #[cfg(not(feature = "tor"))]
-pub async fn get_tor_agent() -> Result<Option<()>, Error> {
+pub async fn get_tor_http_client() -> Result<Option<()>, Error> {
     Ok(None)
 }
 
@@ -241,16 +458,54 @@ impl HttpClientTor {
     /// Get the appropriate client for making requests
     async fn get_client(&self) -> Result<ClientType, Error> {
         if self.should_use_tor() {
-            let tor_agent = get_tor_agent().await?;
-            match tor_agent {
-                Some(agent) => Ok(ClientType::Tor(agent)),
+            let url_str = self.mint_url.to_string();
+            let is_onion = url_str.contains(".onion");
+            
+            let tor_http_client = get_tor_http_client().await?;
+            match tor_http_client {
+                Some(client) => {
+                    tracing::info!("Using Tor client for {}", url_str);
+                    Ok(ClientType::Tor(client))
+                },
                 None => {
-                    // Fallback to HTTP if Tor is not available
+                    // Tor is not initialized
+                    // Check if TorPolicy::Always is set
+                    let config = TOR_MANAGER.get_config();
+                    let is_always_tor = config
+                        .as_ref()
+                        .map(|c| matches!(c.policy, TorPolicy::Always))
+                        .unwrap_or(false);
+                    
+                    if is_onion || is_always_tor {
+                        // For .onion addresses or TorPolicy::Always, Tor is required
+                        return Err(Error::TorError(
+                            format!(
+                                "Tor is not initialized. {} Please call set_tor_config_with_paths() \
+                                with proper storage directories before accessing the mint.",
+                                if is_onion { "For .onion addresses," } else { "TorPolicy::Always is set." }
+                            )
+                        ));
+                    }
+                    // For non-onion addresses with OnionOnly policy, fallback to HTTP
+                    tracing::warn!("Tor not initialized for non-onion address, falling back to HTTP client");
                     Ok(ClientType::Http(self.http_client.clone()))
                 }
             }
         } else {
+            tracing::info!("Using direct HTTP client for {}", self.mint_url);
             Ok(ClientType::Http(self.http_client.clone()))
+        }
+    }
+    
+    /// Get URL with correct protocol for Tor requests
+    /// For .onion addresses, use http instead of https
+    fn get_tor_url(&self) -> String {
+        let url_str = self.mint_url.to_string();
+        if url_str.starts_with("https://") && url_str.contains(".onion") {
+            // Replace https with http for .onion addresses
+            url_str.replace("https://", "http://")
+        } else {
+            url_str
         }
     }
 }
@@ -259,7 +514,7 @@ impl HttpClientTor {
 #[derive(Debug)]
 enum ClientType {
     Http(HttpClient),
-    Tor(Agent),
+    Tor(Arc<reqwest::Client>),
 }
 
 #[cfg(feature = "tor")]
@@ -269,17 +524,20 @@ impl MintConnector for HttpClientTor {
         let client = self.get_client().await?;
         match client {
             ClientType::Http(http_client) => http_client.get_mint_keys().await,
-            ClientType::Tor(tor_agent) => {
-                // Make request through Tor agent
-                let url = format!("{}/keys", self.mint_url);
-                let mut response = tor_agent.get(&url).call()
+            ClientType::Tor(tor_client) => {
+                let base_url = self.get_tor_url();
+                let url = format!("{}/v1/keys", base_url);
+                
+                let response = tor_client.get(&url)
+                    .send()
+                    .await
                     .map_err(|e| Error::TorError(format!("Tor request failed: {}", e)))?;
                 
-                let keys: Vec<KeySet> = serde_json::from_str(&response.body_mut().read_to_string()
-                    .map_err(|e| Error::TorError(format!("Failed to read response: {}", e)))?)
+                let keys_response: KeysResponse = response.json()
+                    .await
                     .map_err(|e| Error::TorError(format!("Failed to parse response: {}", e)))?;
                 
-                Ok(keys)
+                Ok(keys_response.keysets)
             }
         }
     }
@@ -288,16 +546,20 @@ impl MintConnector for HttpClientTor {
         let client = self.get_client().await?;
         match client {
             ClientType::Http(http_client) => http_client.get_mint_keyset(keyset_id).await,
-            ClientType::Tor(tor_agent) => {
-                let url = format!("{}/keys/{}", self.mint_url, keyset_id);
-                let mut response = tor_agent.get(&url).call()
+            ClientType::Tor(tor_client) => {
+                let base_url = self.get_tor_url();
+                let url = format!("{}/v1/keys/{}", base_url, keyset_id);
+                
+                let response = tor_client.get(&url)
+                    .send()
+                    .await
                     .map_err(|e| Error::TorError(format!("Tor request failed: {}", e)))?;
                 
-                let keyset: KeySet = serde_json::from_str(&response.body_mut().read_to_string()
-                    .map_err(|e| Error::TorError(format!("Failed to read response: {}", e)))?)
+                let keys_response: KeysResponse = response.json()
+                    .await
                     .map_err(|e| Error::TorError(format!("Failed to parse response: {}", e)))?;
                 
-                Ok(keyset)
+                Ok(keys_response.keysets.first().unwrap().clone())
             }
         }
     }
@@ -306,13 +568,17 @@ impl MintConnector for HttpClientTor {
         let client = self.get_client().await?;
         match client {
             ClientType::Http(http_client) => http_client.get_mint_keysets().await,
-            ClientType::Tor(tor_agent) => {
-                let url = format!("{}/keysets", self.mint_url);
-                let mut response = tor_agent.get(&url).call()
+            ClientType::Tor(tor_client) => {
+                let base_url = self.get_tor_url();
+                let url = format!("{}/v1/keysets", base_url);
+                
+                let response = tor_client.get(&url)
+                    .send()
+                    .await
                     .map_err(|e| Error::TorError(format!("Tor request failed: {}", e)))?;
                 
-                let keysets: KeysetResponse = serde_json::from_str(&response.body_mut().read_to_string()
-                    .map_err(|e| Error::TorError(format!("Failed to read response: {}", e)))?)
+                let keysets: KeysetResponse = response.json()
+                    .await
                     .map_err(|e| Error::TorError(format!("Failed to parse response: {}", e)))?;
                 
                 Ok(keysets)
@@ -324,14 +590,18 @@ impl MintConnector for HttpClientTor {
         let client = self.get_client().await?;
         match client {
             ClientType::Http(http_client) => http_client.post_mint_quote(request).await,
-            ClientType::Tor(tor_agent) => {
-                let url = format!("{}/mint/quote/bolt11", self.mint_url);
-                let mut response = tor_agent.post(&url)
-                    .send_json(request)
+            ClientType::Tor(tor_client) => {
+                let base_url = self.get_tor_url();
+                let url = format!("{}/v1/mint/quote/bolt11", base_url);
+                
+                let response = tor_client.post(&url)
+                    .json(&request)
+                    .send()
+                    .await
                     .map_err(|e| Error::TorError(format!("Tor request failed: {}", e)))?;
                 
-                let quote: MintQuoteBolt11Response<String> = serde_json::from_str(&response.body_mut().read_to_string()
-                    .map_err(|e| Error::TorError(format!("Failed to read response: {}", e)))?)
+                let quote: MintQuoteBolt11Response<String> = response.json()
+                    .await
                     .map_err(|e| Error::TorError(format!("Failed to parse response: {}", e)))?;
                 
                 Ok(quote)
@@ -343,13 +613,17 @@ impl MintConnector for HttpClientTor {
         let client = self.get_client().await?;
         match client {
             ClientType::Http(http_client) => http_client.get_mint_quote_status(quote_id).await,
-            ClientType::Tor(tor_agent) => {
-                let url = format!("{}/mint/quote/bolt11/{}", self.mint_url, quote_id);
-                let mut response = tor_agent.get(&url).call()
+            ClientType::Tor(tor_client) => {
+                let base_url = self.get_tor_url();
+                let url = format!("{}/v1/mint/quote/bolt11/{}", base_url, quote_id);
+                
+                let response = tor_client.get(&url)
+                    .send()
+                    .await
                     .map_err(|e| Error::TorError(format!("Tor request failed: {}", e)))?;
                 
-                let quote: MintQuoteBolt11Response<String> = serde_json::from_str(&response.body_mut().read_to_string()
-                    .map_err(|e| Error::TorError(format!("Failed to read response: {}", e)))?)
+                let quote: MintQuoteBolt11Response<String> = response.json()
+                    .await
                     .map_err(|e| Error::TorError(format!("Failed to parse response: {}", e)))?;
                 
                 Ok(quote)
@@ -361,14 +635,18 @@ impl MintConnector for HttpClientTor {
         let client = self.get_client().await?;
         match client {
             ClientType::Http(http_client) => http_client.post_mint(request).await,
-            ClientType::Tor(tor_agent) => {
-                let url = format!("{}/mint/bolt11", self.mint_url);
-                let mut response = tor_agent.post(&url)
-                    .send_json(request)
+            ClientType::Tor(tor_client) => {
+                let base_url = self.get_tor_url();
+                let url = format!("{}/v1/mint/bolt11", base_url);
+                
+                let response = tor_client.post(&url)
+                    .json(&request)
+                    .send()
+                    .await
                     .map_err(|e| Error::TorError(format!("Tor request failed: {}", e)))?;
                 
-                let mint_response: MintResponse = serde_json::from_str(&response.body_mut().read_to_string()
-                    .map_err(|e| Error::TorError(format!("Failed to read response: {}", e)))?)
+                let mint_response: MintResponse = response.json()
+                    .await
                     .map_err(|e| Error::TorError(format!("Failed to parse response: {}", e)))?;
                 
                 Ok(mint_response)
@@ -380,14 +658,18 @@ impl MintConnector for HttpClientTor {
         let client = self.get_client().await?;
         match client {
             ClientType::Http(http_client) => http_client.post_melt_quote(request).await,
-            ClientType::Tor(tor_agent) => {
-                let url = format!("{}/melt/quote/bolt11", self.mint_url);
-                let mut response = tor_agent.post(&url)
-                    .send_json(request)
+            ClientType::Tor(tor_client) => {
+                let base_url = self.get_tor_url();
+                let url = format!("{}/v1/melt/quote/bolt11", base_url);
+                
+                let response = tor_client.post(&url)
+                    .json(&request)
+                    .send()
+                    .await
                     .map_err(|e| Error::TorError(format!("Tor request failed: {}", e)))?;
                 
-                let quote: MeltQuoteBolt11Response<String> = serde_json::from_str(&response.body_mut().read_to_string()
-                    .map_err(|e| Error::TorError(format!("Failed to read response: {}", e)))?)
+                let quote: MeltQuoteBolt11Response<String> = response.json()
+                    .await
                     .map_err(|e| Error::TorError(format!("Failed to parse response: {}", e)))?;
                 
                 Ok(quote)
@@ -399,13 +681,17 @@ impl MintConnector for HttpClientTor {
         let client = self.get_client().await?;
         match client {
             ClientType::Http(http_client) => http_client.get_melt_quote_status(quote_id).await,
-            ClientType::Tor(tor_agent) => {
-                let url = format!("{}/melt/quote/bolt11/{}", self.mint_url, quote_id);
-                let mut response = tor_agent.get(&url).call()
+            ClientType::Tor(tor_client) => {
+                let base_url = self.get_tor_url();
+                let url = format!("{}/v1/melt/quote/bolt11/{}", base_url, quote_id);
+                
+                let response = tor_client.get(&url)
+                    .send()
+                    .await
                     .map_err(|e| Error::TorError(format!("Tor request failed: {}", e)))?;
                 
-                let quote: MeltQuoteBolt11Response<String> = serde_json::from_str(&response.body_mut().read_to_string()
-                    .map_err(|e| Error::TorError(format!("Failed to read response: {}", e)))?)
+                let quote: MeltQuoteBolt11Response<String> = response.json()
+                    .await
                     .map_err(|e| Error::TorError(format!("Failed to parse response: {}", e)))?;
                 
                 Ok(quote)
@@ -417,14 +703,18 @@ impl MintConnector for HttpClientTor {
         let client = self.get_client().await?;
         match client {
             ClientType::Http(http_client) => http_client.post_melt(request).await,
-            ClientType::Tor(tor_agent) => {
-                let url = format!("{}/melt/bolt11", self.mint_url);
-                let mut response = tor_agent.post(&url)
-                    .send_json(request)
+            ClientType::Tor(tor_client) => {
+                let base_url = self.get_tor_url();
+                let url = format!("{}/v1/melt/bolt11", base_url);
+                
+                let response = tor_client.post(&url)
+                    .json(&request)
+                    .send()
+                    .await
                     .map_err(|e| Error::TorError(format!("Tor request failed: {}", e)))?;
                 
-                let melt_response: MeltQuoteBolt11Response<String> = serde_json::from_str(&response.body_mut().read_to_string()
-                    .map_err(|e| Error::TorError(format!("Failed to read response: {}", e)))?)
+                let melt_response: MeltQuoteBolt11Response<String> = response.json()
+                    .await
                     .map_err(|e| Error::TorError(format!("Failed to parse response: {}", e)))?;
                 
                 Ok(melt_response)
@@ -436,14 +726,18 @@ impl MintConnector for HttpClientTor {
         let client = self.get_client().await?;
         match client {
             ClientType::Http(http_client) => http_client.post_swap(request).await,
-            ClientType::Tor(tor_agent) => {
-                let url = format!("{}/swap", self.mint_url);
-                let mut response = tor_agent.post(&url)
-                    .send_json(request)
+            ClientType::Tor(tor_client) => {
+                let base_url = self.get_tor_url();
+                let url = format!("{}/v1/swap", base_url);
+                
+                let response = tor_client.post(&url)
+                    .json(&request)
+                    .send()
+                    .await
                     .map_err(|e| Error::TorError(format!("Tor request failed: {}", e)))?;
                 
-                let swap_response: SwapResponse = serde_json::from_str(&response.body_mut().read_to_string()
-                    .map_err(|e| Error::TorError(format!("Failed to read response: {}", e)))?)
+                let swap_response: SwapResponse = response.json()
+                    .await
                     .map_err(|e| Error::TorError(format!("Failed to parse response: {}", e)))?;
                 
                 Ok(swap_response)
@@ -455,14 +749,18 @@ impl MintConnector for HttpClientTor {
         let client = self.get_client().await?;
         match client {
             ClientType::Http(http_client) => http_client.get_mint_info().await,
-            ClientType::Tor(tor_agent) => {
-                // Make request through Tor agent
-                let url = format!("{}/info", self.mint_url);
-                let mut response = tor_agent.get(&url).call()
+            ClientType::Tor(tor_client) => {
+                let base_url = self.get_tor_url();
+                let url = format!("{}/v1/info", base_url);
+                
+                // Make async reqwest GET request through Tor
+                let response = tor_client.get(&url)
+                    .send()
+                    .await
                     .map_err(|e| Error::TorError(format!("Tor request failed: {}", e)))?;
                 
-                let mint_info: MintInfo = serde_json::from_str(&response.body_mut().read_to_string()
-                    .map_err(|e| Error::TorError(format!("Failed to read response: {}", e)))?)
+                let mint_info: MintInfo = response.json()
+                    .await
                     .map_err(|e| Error::TorError(format!("Failed to parse response: {}", e)))?;
                 
                 Ok(mint_info)
@@ -474,14 +772,18 @@ impl MintConnector for HttpClientTor {
         let client = self.get_client().await?;
         match client {
             ClientType::Http(http_client) => http_client.post_check_state(request).await,
-            ClientType::Tor(tor_agent) => {
-                let url = format!("{}/check", self.mint_url);
-                let mut response = tor_agent.post(&url)
-                    .send_json(request)
+            ClientType::Tor(tor_client) => {
+                let base_url = self.get_tor_url();
+                let url = format!("{}/v1/checkstate", base_url);
+                
+                let response = tor_client.post(&url)
+                    .json(&request)
+                    .send()
+                    .await
                     .map_err(|e| Error::TorError(format!("Tor request failed: {}", e)))?;
                 
-                let state_response: CheckStateResponse = serde_json::from_str(&response.body_mut().read_to_string()
-                    .map_err(|e| Error::TorError(format!("Failed to read response: {}", e)))?)
+                let state_response: CheckStateResponse = response.json()
+                    .await
                     .map_err(|e| Error::TorError(format!("Failed to parse response: {}", e)))?;
                 
                 Ok(state_response)
@@ -493,14 +795,18 @@ impl MintConnector for HttpClientTor {
         let client = self.get_client().await?;
         match client {
             ClientType::Http(http_client) => http_client.post_restore(request).await,
-            ClientType::Tor(tor_agent) => {
-                let url = format!("{}/restore", self.mint_url);
-                let mut response = tor_agent.post(&url)
-                    .send_json(request)
+            ClientType::Tor(tor_client) => {
+                let base_url = self.get_tor_url();
+                let url = format!("{}/v1/restore", base_url);
+                
+                let response = tor_client.post(&url)
+                    .json(&request)
+                    .send()
+                    .await
                     .map_err(|e| Error::TorError(format!("Tor request failed: {}", e)))?;
                 
-                let restore_response: RestoreResponse = serde_json::from_str(&response.body_mut().read_to_string()
-                    .map_err(|e| Error::TorError(format!("Failed to read response: {}", e)))?)
+                let restore_response: RestoreResponse = response.json()
+                    .await
                     .map_err(|e| Error::TorError(format!("Failed to parse response: {}", e)))?;
                 
                 Ok(restore_response)
