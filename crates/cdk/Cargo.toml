@@ -50,11 +50,11 @@ utoipa = { workspace = true, optional = true }
 uuid.workspace = true
 jsonwebtoken = { workspace = true, optional = true }
 
-# Optional Tor dependencies (path to local arti workspace)
-arti-client = { path = "../../../arti/crates/arti-client", optional = true, default-features = false, features = ["tokio", "native-tls", "bridge-client", "pt-client", "onion-service-client"] }
-arti = { path = "../../../arti/crates/arti", optional = true, default-features = false, features = ["tokio", "native-tls", "experimental-api"] }
-tor-rtcompat = { path = "../../../arti/crates/tor-rtcompat", optional = true, default-features = false, features = ["tokio", "native-tls"] }
-tor-config = { path = "../../../arti/crates/tor-config", optional = true }
+# Optional Tor dependencies (using crates.io versions)
+arti-client = { version = "0.25", optional = true, default-features = false, features = ["tokio", "native-tls", "bridge-client", "pt-client", "onion-service-client"] }
+arti = { version = "0.25", optional = true, default-features = false, features = ["tokio", "native-tls", "experimental-api"] }
+tor-rtcompat = { version = "0.25", optional = true, default-features = false, features = ["tokio", "native-tls"] }
+tor-config = { version = "0.25", optional = true }
 # Additional dependencies for Tor support
 lazy_static = { version = "1.5", optional = true }
 
