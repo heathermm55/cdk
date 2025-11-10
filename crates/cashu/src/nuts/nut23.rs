@@ -8,10 +8,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-#[cfg(feature = "mint")]
-use uuid::Uuid;
 
 use super::{BlindSignature, CurrencyUnit, MeltQuoteState, Mpp, PublicKey};
+#[cfg(feature = "mint")]
+use crate::quote_id::QuoteId;
 use crate::Amount;
 
 /// NUT023 Error
@@ -54,10 +54,6 @@ pub enum QuoteState {
     Unpaid,
     /// Quote has been paid and wallet can mint
     Paid,
-    /// Minting is in progress
-    /// **Note:** This state is to be used internally but is not part of the
-    /// nut.
-    Pending,
     /// ecash issued for quote
     Issued,
 }
@@ -67,7 +63,6 @@ impl fmt::Display for QuoteState {
         match self {
             Self::Unpaid => write!(f, "UNPAID"),
             Self::Paid => write!(f, "PAID"),
-            Self::Pending => write!(f, "PENDING"),
             Self::Issued => write!(f, "ISSUED"),
         }
     }
@@ -78,7 +73,6 @@ impl FromStr for QuoteState {
 
     fn from_str(state: &str) -> Result<Self, Self::Err> {
         match state {
-            "PENDING" => Ok(Self::Pending),
             "PAID" => Ok(Self::Paid),
             "UNPAID" => Ok(Self::Unpaid),
             "ISSUED" => Ok(Self::Issued),
@@ -126,8 +120,8 @@ impl<Q: ToString> MintQuoteBolt11Response<Q> {
 }
 
 #[cfg(feature = "mint")]
-impl From<MintQuoteBolt11Response<Uuid>> for MintQuoteBolt11Response<String> {
-    fn from(value: MintQuoteBolt11Response<Uuid>) -> Self {
+impl From<MintQuoteBolt11Response<QuoteId>> for MintQuoteBolt11Response<String> {
+    fn from(value: MintQuoteBolt11Response<QuoteId>) -> Self {
         Self {
             quote: value.quote.to_string(),
             request: value.request,
@@ -299,8 +293,8 @@ impl<Q: ToString> MeltQuoteBolt11Response<Q> {
 }
 
 #[cfg(feature = "mint")]
-impl From<MeltQuoteBolt11Response<Uuid>> for MeltQuoteBolt11Response<String> {
-    fn from(value: MeltQuoteBolt11Response<Uuid>) -> Self {
+impl From<MeltQuoteBolt11Response<QuoteId>> for MeltQuoteBolt11Response<String> {
+    fn from(value: MeltQuoteBolt11Response<QuoteId>) -> Self {
         Self {
             quote: value.quote.to_string(),
             amount: value.amount,

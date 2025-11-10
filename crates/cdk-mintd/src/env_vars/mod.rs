@@ -4,6 +4,7 @@
 //! organized by component.
 
 mod common;
+mod database;
 mod info;
 mod ln;
 mod mint_info;
@@ -16,12 +17,16 @@ mod cln;
 mod fake_wallet;
 #[cfg(feature = "grpc-processor")]
 mod grpc_processor;
+#[cfg(feature = "ldk-node")]
+mod ldk_node;
 #[cfg(feature = "lnbits")]
 mod lnbits;
 #[cfg(feature = "lnd")]
 mod lnd;
 #[cfg(feature = "management-rpc")]
 mod management_rpc;
+#[cfg(feature = "prometheus")]
+mod prometheus;
 
 use std::env;
 use std::str::FromStr;
@@ -32,10 +37,13 @@ pub use auth::*;
 #[cfg(feature = "cln")]
 pub use cln::*;
 pub use common::*;
+pub use database::*;
 #[cfg(feature = "fakewallet")]
 pub use fake_wallet::*;
 #[cfg(feature = "grpc-processor")]
 pub use grpc_processor::*;
+#[cfg(feature = "ldk-node")]
+pub use ldk_node::*;
 pub use ln::*;
 #[cfg(feature = "lnbits")]
 pub use lnbits::*;
@@ -44,14 +52,42 @@ pub use lnd::*;
 #[cfg(feature = "management-rpc")]
 pub use management_rpc::*;
 pub use mint_info::*;
+#[cfg(feature = "prometheus")]
+pub use prometheus::*;
 
-use crate::config::{Database, DatabaseEngine, LnBackend, Settings};
+use crate::config::{DatabaseEngine, LnBackend, Settings};
 
 impl Settings {
     pub fn from_env(&mut self) -> Result<Self> {
         if let Ok(database) = env::var(DATABASE_ENV_VAR) {
             let engine = DatabaseEngine::from_str(&database).map_err(|err| anyhow!(err))?;
-            self.database = Database { engine };
+            self.database.engine = engine;
+        }
+
+        // Parse PostgreSQL-specific configuration from environment variables
+        if self.database.engine == DatabaseEngine::Postgres {
+            self.database.postgres = Some(
+                self.database
+                    .postgres
+                    .clone()
+                    .unwrap_or_default()
+                    .from_env(),
+            );
+        }
+
+        // Parse auth database configuration from environment variables (when auth is enabled)
+        #[cfg(feature = "auth")]
+        {
+            self.auth_database = Some(crate::config::AuthDatabase {
+                postgres: Some(
+                    self.auth_database
+                        .clone()
+                        .unwrap_or_default()
+                        .postgres
+                        .unwrap_or_default()
+                        .from_env(),
+                ),
+            });
         }
 
         self.info = self.info.clone().from_env();
@@ -63,14 +99,8 @@ impl Settings {
             // Check env vars for auth config even if None
             let auth = self.auth.clone().unwrap_or_default().from_env();
 
-            // Only set auth if env vars are present and have non-default values
-            if auth.openid_discovery != String::default()
-                || auth.openid_client_id != String::default()
-                || auth.mint_max_bat != 0
-                || auth.enabled_mint
-                || auth.enabled_melt
-                || auth.enabled_swap
-            {
+            // Only set auth if auth_enabled flag is true
+            if auth.auth_enabled {
                 self.auth = Some(auth);
             } else {
                 self.auth = None;
@@ -85,6 +115,11 @@ impl Settings {
                     .unwrap_or_default()
                     .from_env(),
             );
+        }
+
+        #[cfg(feature = "prometheus")]
+        {
+            self.prometheus = Some(self.prometheus.clone().unwrap_or_default().from_env());
         }
 
         match self.ln.ln_backend {
@@ -103,6 +138,10 @@ impl Settings {
             #[cfg(feature = "lnd")]
             LnBackend::Lnd => {
                 self.lnd = Some(self.lnd.clone().unwrap_or_default().from_env());
+            }
+            #[cfg(feature = "ldk-node")]
+            LnBackend::LdkNode => {
+                self.ldk_node = Some(self.ldk_node.clone().unwrap_or_default().from_env());
             }
             #[cfg(feature = "grpc-processor")]
             LnBackend::GrpcProcessor => {

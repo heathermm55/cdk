@@ -18,6 +18,8 @@ use super::nut10;
 #[cfg(feature = "wallet")]
 use super::nut11::SpendingConditions;
 #[cfg(feature = "wallet")]
+use crate::amount::FeeAndAmounts;
+#[cfg(feature = "wallet")]
 use crate::amount::SplitTarget;
 #[cfg(feature = "wallet")]
 use crate::dhke::blind_message;
@@ -279,12 +281,12 @@ impl PartialOrd for BlindSignature {
 #[serde(untagged)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub enum Witness {
-    /// P2PK Witness
-    #[serde(with = "serde_p2pk_witness")]
-    P2PKWitness(P2PKWitness),
     /// HTLC Witness
     #[serde(with = "serde_htlc_witness")]
     HTLCWitness(HTLCWitness),
+    /// P2PK Witness
+    #[serde(with = "serde_p2pk_witness")]
+    P2PKWitness(P2PKWitness),
 }
 
 impl From<P2PKWitness> for Witness {
@@ -591,14 +593,14 @@ impl CurrencyUnit {
 impl FromStr for CurrencyUnit {
     type Err = Error;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let value = &value.to_uppercase();
-        match value.as_str() {
+        let upper_value = value.to_uppercase();
+        match upper_value.as_str() {
             "SAT" => Ok(Self::Sat),
             "MSAT" => Ok(Self::Msat),
             "USD" => Ok(Self::Usd),
             "EUR" => Ok(Self::Eur),
             "AUTH" => Ok(Self::Auth),
-            c => Ok(Self::Custom(c.to_string())),
+            _ => Ok(Self::Custom(value.to_string())),
         }
     }
 }
@@ -641,13 +643,14 @@ impl<'de> Deserialize<'de> for CurrencyUnit {
 }
 
 /// Payment Method
-#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub enum PaymentMethod {
     /// Bolt11 payment type
     #[default]
     Bolt11,
+    /// Bolt12
+    Bolt12,
     /// Custom
     Custom(String),
 }
@@ -657,6 +660,7 @@ impl FromStr for PaymentMethod {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.to_lowercase().as_str() {
             "bolt11" => Ok(Self::Bolt11),
+            "bolt12" => Ok(Self::Bolt12),
             c => Ok(Self::Custom(c.to_string())),
         }
     }
@@ -666,6 +670,7 @@ impl fmt::Display for PaymentMethod {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PaymentMethod::Bolt11 => write!(f, "bolt11"),
+            PaymentMethod::Bolt12 => write!(f, "bolt12"),
             PaymentMethod::Custom(p) => write!(f, "{p}"),
         }
     }
@@ -743,8 +748,9 @@ impl PreMintSecrets {
         keyset_id: Id,
         amount: Amount,
         amount_split_target: &SplitTarget,
+        fee_and_amounts: &FeeAndAmounts,
     ) -> Result<Self, Error> {
-        let amount_split = amount.split_targeted(amount_split_target)?;
+        let amount_split = amount.split_targeted(amount_split_target, fee_and_amounts)?;
 
         let mut output = Vec::with_capacity(amount_split.len());
 
@@ -827,8 +833,9 @@ impl PreMintSecrets {
         amount: Amount,
         amount_split_target: &SplitTarget,
         conditions: &SpendingConditions,
+        fee_and_amounts: &FeeAndAmounts,
     ) -> Result<Self, Error> {
-        let amount_split = amount.split_targeted(amount_split_target)?;
+        let amount_split = amount.split_targeted(amount_split_target, fee_and_amounts)?;
 
         let mut output = Vec::with_capacity(amount_split.len());
 
@@ -923,7 +930,10 @@ impl Iterator for PreMintSecrets {
 
     fn next(&mut self) -> Option<Self::Item> {
         // Use the iterator of the vector
-        self.secrets.pop()
+        if self.secrets.is_empty() {
+            return None;
+        }
+        Some(self.secrets.remove(0))
     }
 }
 
@@ -973,5 +983,90 @@ mod tests {
         let b = PreMintSecrets::blank(Id::from_str("009a1f293253e41e").unwrap(), Amount::from(1))
             .unwrap();
         assert_eq!(b.len(), 1);
+    }
+
+    #[test]
+    fn custom_unit_ser_der() {
+        let unit = CurrencyUnit::Custom(String::from("test"));
+        let serialized = serde_json::to_string(&unit).unwrap();
+        let deserialized: CurrencyUnit = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(unit, deserialized)
+    }
+
+    #[test]
+    fn test_payment_method_parsing() {
+        // Test standard variants
+        assert_eq!(
+            PaymentMethod::from_str("bolt11").unwrap(),
+            PaymentMethod::Bolt11
+        );
+        assert_eq!(
+            PaymentMethod::from_str("BOLT11").unwrap(),
+            PaymentMethod::Bolt11
+        );
+        assert_eq!(
+            PaymentMethod::from_str("Bolt11").unwrap(),
+            PaymentMethod::Bolt11
+        );
+
+        assert_eq!(
+            PaymentMethod::from_str("bolt12").unwrap(),
+            PaymentMethod::Bolt12
+        );
+        assert_eq!(
+            PaymentMethod::from_str("BOLT12").unwrap(),
+            PaymentMethod::Bolt12
+        );
+        assert_eq!(
+            PaymentMethod::from_str("Bolt12").unwrap(),
+            PaymentMethod::Bolt12
+        );
+
+        // Test custom variants
+        assert_eq!(
+            PaymentMethod::from_str("custom").unwrap(),
+            PaymentMethod::Custom("custom".to_string())
+        );
+        assert_eq!(
+            PaymentMethod::from_str("CUSTOM").unwrap(),
+            PaymentMethod::Custom("custom".to_string())
+        );
+
+        // Test serialization/deserialization consistency
+        let methods = vec![
+            PaymentMethod::Bolt11,
+            PaymentMethod::Bolt12,
+            PaymentMethod::Custom("test".to_string()),
+        ];
+
+        for method in methods {
+            let serialized = serde_json::to_string(&method).unwrap();
+            let deserialized: PaymentMethod = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(method, deserialized);
+        }
+    }
+
+    #[test]
+    fn test_witness_serialization() {
+        let htlc_witness = HTLCWitness {
+            preimage: "preimage".to_string(),
+            signatures: Some(vec!["sig1".to_string()]),
+        };
+        let witness = Witness::HTLCWitness(htlc_witness);
+
+        let serialized = serde_json::to_string(&witness).unwrap();
+        let deserialized: Witness = serde_json::from_str(&serialized).unwrap();
+
+        assert!(matches!(deserialized, Witness::HTLCWitness(_)));
+
+        let p2pk_witness = P2PKWitness {
+            signatures: vec!["sig1".to_string(), "sig2".to_string()],
+        };
+        let witness = Witness::P2PKWitness(p2pk_witness);
+
+        let serialized = serde_json::to_string(&witness).unwrap();
+        let deserialized: Witness = serde_json::from_str(&serialized).unwrap();
+
+        assert!(matches!(deserialized, Witness::P2PKWitness(_)));
     }
 }

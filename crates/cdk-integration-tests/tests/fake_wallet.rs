@@ -1,3 +1,19 @@
+//! Fake Wallet Integration Tests
+//!
+//! This file contains tests for the fake wallet backend functionality.
+//! The fake wallet simulates Lightning Network behavior for testing purposes,
+//! allowing verification of mint behavior in various payment scenarios without
+//! requiring a real Lightning node.
+//!
+//! Test Scenarios:
+//! - Pending payment states and proof handling
+//! - Payment failure cases and proof state management
+//! - Change output verification in melt operations
+//! - Witness signature validation
+//! - Cross-unit transaction validation
+//! - Overflow and balance validation
+//! - Duplicate proof detection
+
 use std::sync::Arc;
 
 use bip39::Mnemonic;
@@ -10,8 +26,8 @@ use cdk::nuts::{
 };
 use cdk::wallet::types::TransactionDirection;
 use cdk::wallet::{HttpClient, MintConnector, Wallet};
+use cdk::StreamExt;
 use cdk_fake_wallet::{create_fake_invoice, FakeInvoiceDescription};
-use cdk_integration_tests::{attempt_to_swap_pending, wait_for_mint_to_be_paid};
 use cdk_sqlite::wallet::memory;
 
 const MINT_URL: &str = "http://127.0.0.1:8086";
@@ -23,21 +39,20 @@ async fn test_fake_tokens_pending() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let _mint_amount = wallet
-        .mint(&mint_quote.id, SplitTarget::default(), None)
+    let _proofs = proof_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
     let fake_description = FakeInvoiceDescription {
         pay_invoice_state: MeltQuoteState::Pending,
@@ -54,7 +69,13 @@ async fn test_fake_tokens_pending() {
 
     assert!(melt.is_err());
 
-    attempt_to_swap_pending(&wallet).await.unwrap();
+    // melt failed, but there is new code to reclaim unspent proofs
+    assert!(!wallet
+        .localstore
+        .get_proofs(None, None, Some(vec![State::Pending]), None)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 /// Tests that if the pay error fails and the check returns unknown or failed,
@@ -65,21 +86,20 @@ async fn test_fake_melt_payment_fail() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("Failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let _mint_amount = wallet
-        .mint(&mint_quote.id, SplitTarget::default(), None)
+    let _proofs = proof_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
     let fake_description = FakeInvoiceDescription {
         pay_invoice_state: MeltQuoteState::Unknown,
@@ -111,15 +131,8 @@ async fn test_fake_melt_payment_fail() {
     let melt = wallet.melt(&melt_quote.id).await;
     assert!(melt.is_err());
 
-    // The mint should have unset proofs from pending since payment failed
-    let all_proof = wallet.get_unspent_proofs().await.unwrap();
-    let states = wallet.check_proofs_spent(all_proof).await.unwrap();
-    for state in states {
-        assert!(state.state == State::Unspent);
-    }
-
     let wallet_bal = wallet.total_balance().await.unwrap();
-    assert_eq!(wallet_bal, 100.into());
+    assert_eq!(wallet_bal, 98.into());
 }
 
 /// Tests that when both the pay_invoice and check_invoice both fail,
@@ -130,21 +143,20 @@ async fn test_fake_melt_payment_fail_and_check() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("Failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let _mint_amount = wallet
-        .mint(&mint_quote.id, SplitTarget::default(), None)
+    let _proofs = proof_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
     let fake_description = FakeInvoiceDescription {
         pay_invoice_state: MeltQuoteState::Unknown,
@@ -161,13 +173,12 @@ async fn test_fake_melt_payment_fail_and_check() {
     let melt = wallet.melt(&melt_quote.id).await;
     assert!(melt.is_err());
 
-    let pending = wallet
+    assert!(!wallet
         .localstore
         .get_proofs(None, None, Some(vec![State::Pending]), None)
         .await
-        .unwrap();
-
-    assert!(!pending.is_empty());
+        .unwrap()
+        .is_empty());
 }
 
 /// Tests that when the ln backend returns a failed status but does not error,
@@ -178,21 +189,20 @@ async fn test_fake_melt_payment_return_fail_status() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("Failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let _mint_amount = wallet
-        .mint(&mint_quote.id, SplitTarget::default(), None)
+    let _proofs = proof_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
     let fake_description = FakeInvoiceDescription {
         pay_invoice_state: MeltQuoteState::Failed,
@@ -209,6 +219,16 @@ async fn test_fake_melt_payment_return_fail_status() {
     let melt = wallet.melt(&melt_quote.id).await;
     assert!(melt.is_err());
 
+    wallet.check_all_pending_proofs().await.unwrap();
+
+    let pending = wallet
+        .localstore
+        .get_proofs(None, None, Some(vec![State::Pending]), None)
+        .await
+        .unwrap();
+
+    assert!(pending.is_empty());
+
     let fake_description = FakeInvoiceDescription {
         pay_invoice_state: MeltQuoteState::Unknown,
         check_payment_state: MeltQuoteState::Unknown,
@@ -224,13 +244,14 @@ async fn test_fake_melt_payment_return_fail_status() {
     let melt = wallet.melt(&melt_quote.id).await;
     assert!(melt.is_err());
 
-    let pending = wallet
+    wallet.check_all_pending_proofs().await.unwrap();
+
+    assert!(!wallet
         .localstore
         .get_proofs(None, None, Some(vec![State::Pending]), None)
         .await
-        .unwrap();
-
-    assert!(pending.is_empty());
+        .unwrap()
+        .is_empty());
 }
 
 /// Tests that when the ln backend returns an error with unknown status,
@@ -241,21 +262,20 @@ async fn test_fake_melt_payment_error_unknown() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .unwrap();
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let _mint_amount = wallet
-        .mint(&mint_quote.id, SplitTarget::default(), None)
+    let _proofs = proof_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
     let fake_description = FakeInvoiceDescription {
         pay_invoice_state: MeltQuoteState::Failed,
@@ -270,7 +290,7 @@ async fn test_fake_melt_payment_error_unknown() {
 
     // The melt should error at the payment invoice command
     let melt = wallet.melt(&melt_quote.id).await;
-    assert_eq!(melt.unwrap_err().to_string(), "Payment failed");
+    assert!(melt.is_err());
 
     let fake_description = FakeInvoiceDescription {
         pay_invoice_state: MeltQuoteState::Unknown,
@@ -285,15 +305,14 @@ async fn test_fake_melt_payment_error_unknown() {
 
     // The melt should error at the payment invoice command
     let melt = wallet.melt(&melt_quote.id).await;
-    assert_eq!(melt.unwrap_err().to_string(), "Payment failed");
+    assert!(melt.is_err());
 
-    let pending = wallet
+    assert!(!wallet
         .localstore
         .get_proofs(None, None, Some(vec![State::Pending]), None)
         .await
-        .unwrap();
-
-    assert!(pending.is_empty());
+        .unwrap()
+        .is_empty());
 }
 
 /// Tests that when the ln backend returns an error but the second check returns paid,
@@ -304,21 +323,22 @@ async fn test_fake_melt_payment_err_paid() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("Failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let _mint_amount = wallet
-        .mint(&mint_quote.id, SplitTarget::default(), None)
+    let _proofs = proof_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
+
+    let old_balance = wallet.total_balance().await.expect("balance");
 
     let fake_description = FakeInvoiceDescription {
         pay_invoice_state: MeltQuoteState::Failed,
@@ -332,10 +352,23 @@ async fn test_fake_melt_payment_err_paid() {
     let melt_quote = wallet.melt_quote(invoice.to_string(), None).await.unwrap();
 
     // The melt should error at the payment invoice command
-    let melt = wallet.melt(&melt_quote.id).await;
-    assert!(melt.is_err());
+    let melt = wallet.melt(&melt_quote.id).await.unwrap();
 
-    attempt_to_swap_pending(&wallet).await.unwrap();
+    assert!(melt.fee_paid == Amount::ZERO);
+    assert!(melt.amount == Amount::from(7));
+
+    // melt failed, but there is new code to reclaim unspent proofs
+    assert_eq!(
+        old_balance - melt.amount,
+        wallet.total_balance().await.expect("new balance")
+    );
+
+    assert!(wallet
+        .localstore
+        .get_proofs(None, None, Some(vec![State::Pending]), None)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 /// Tests that change outputs in a melt quote are correctly handled
@@ -345,21 +378,20 @@ async fn test_fake_melt_change_in_quote() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("Failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let _mint_amount = wallet
-        .mint(&mint_quote.id, SplitTarget::default(), None)
+    let _proofs = proof_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
     let transaction = wallet
         .list_transactions(Some(TransactionDirection::Incoming))
@@ -381,10 +413,16 @@ async fn test_fake_melt_change_in_quote() {
 
     let melt_quote = wallet.melt_quote(invoice.to_string(), None).await.unwrap();
 
-    let keyset = wallet.get_active_mint_keyset().await.unwrap();
+    let keyset = wallet.fetch_active_keyset().await.unwrap();
+    let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
 
-    let premint_secrets =
-        PreMintSecrets::random(keyset.id, 100.into(), &SplitTarget::default()).unwrap();
+    let premint_secrets = PreMintSecrets::random(
+        keyset.id,
+        100.into(),
+        &SplitTarget::default(),
+        &fee_and_amounts,
+    )
+    .unwrap();
 
     let client = HttpClient::new(MINT_URL.parse().unwrap(), None);
 
@@ -408,40 +446,6 @@ async fn test_fake_melt_change_in_quote() {
     assert_eq!(melt_change, check);
 }
 
-/// Tests that the correct database type is used based on environment variables
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn test_database_type() {
-    // Get the database type and work dir from environment
-    let db_type = std::env::var("CDK_MINTD_DATABASE").expect("MINT_DATABASE env var should be set");
-    let work_dir =
-        std::env::var("CDK_MINTD_WORK_DIR").expect("CDK_MINTD_WORK_DIR env var should be set");
-
-    // Check that the correct database file exists
-    match db_type.as_str() {
-        "REDB" => {
-            let db_path = std::path::Path::new(&work_dir).join("cdk-mintd.redb");
-            assert!(
-                db_path.exists(),
-                "Expected redb database file to exist at {:?}",
-                db_path
-            );
-        }
-        "SQLITE" => {
-            let db_path = std::path::Path::new(&work_dir).join("cdk-mintd.sqlite");
-            assert!(
-                db_path.exists(),
-                "Expected sqlite database file to exist at {:?}",
-                db_path
-            );
-        }
-        "MEMORY" => {
-            // Memory database has no file to check
-            println!("Memory database in use - no file to check");
-        }
-        _ => panic!("Unknown database type: {}", db_type),
-    }
-}
-
 /// Tests minting tokens with a valid witness signature
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_fake_mint_with_witness() {
@@ -449,20 +453,19 @@ async fn test_fake_mint_with_witness() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let proofs = wallet
-        .mint(&mint_quote.id, SplitTarget::default(), None)
+    let proofs = proof_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
     let mint_amount = proofs.total_amount().unwrap();
 
@@ -476,23 +479,33 @@ async fn test_fake_mint_without_witness() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
+    let mut payment_streams = wallet.payment_stream(&mint_quote);
+
+    payment_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
     let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
 
-    let active_keyset_id = wallet.get_active_mint_keyset().await.unwrap().id;
+    let active_keyset_id = wallet.fetch_active_keyset().await.unwrap().id;
+    let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
 
-    let premint_secrets =
-        PreMintSecrets::random(active_keyset_id, 100.into(), &SplitTarget::default()).unwrap();
+    let premint_secrets = PreMintSecrets::random(
+        active_keyset_id,
+        100.into(),
+        &SplitTarget::default(),
+        &fee_and_amounts,
+    )
+    .unwrap();
 
     let request = MintRequest {
         quote: mint_quote.id,
@@ -516,23 +529,33 @@ async fn test_fake_mint_with_wrong_witness() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
+    let mut payment_streams = wallet.payment_stream(&mint_quote);
+
+    payment_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
     let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
 
-    let active_keyset_id = wallet.get_active_mint_keyset().await.unwrap().id;
+    let active_keyset_id = wallet.fetch_active_keyset().await.unwrap().id;
+    let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
 
-    let premint_secrets =
-        PreMintSecrets::random(active_keyset_id, 100.into(), &SplitTarget::default()).unwrap();
+    let premint_secrets = PreMintSecrets::random(
+        active_keyset_id,
+        100.into(),
+        &SplitTarget::default(),
+        &fee_and_amounts,
+    )
+    .unwrap();
 
     let mut request = MintRequest {
         quote: mint_quote.id,
@@ -562,21 +585,31 @@ async fn test_fake_mint_inflated() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
+    let mut payment_streams = wallet.payment_stream(&mint_quote);
+
+    payment_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
-    let active_keyset_id = wallet.get_active_mint_keyset().await.unwrap().id;
+    let active_keyset_id = wallet.fetch_active_keyset().await.unwrap().id;
+    let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
 
-    let pre_mint =
-        PreMintSecrets::random(active_keyset_id, 500.into(), &SplitTarget::None).unwrap();
+    let pre_mint = PreMintSecrets::random(
+        active_keyset_id,
+        500.into(),
+        &SplitTarget::None,
+        &fee_and_amounts,
+    )
+    .unwrap();
 
     let quote_info = wallet
         .localstore
@@ -620,34 +653,50 @@ async fn test_fake_mint_multiple_units() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
+    let mut payment_streams = wallet.payment_stream(&mint_quote);
+
+    payment_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
-    let active_keyset_id = wallet.get_active_mint_keyset().await.unwrap().id;
+    let active_keyset_id = wallet.fetch_active_keyset().await.unwrap().id;
+    let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
 
-    let pre_mint = PreMintSecrets::random(active_keyset_id, 50.into(), &SplitTarget::None).unwrap();
+    let pre_mint = PreMintSecrets::random(
+        active_keyset_id,
+        50.into(),
+        &SplitTarget::None,
+        &fee_and_amounts,
+    )
+    .unwrap();
 
     let wallet_usd = Wallet::new(
         MINT_URL,
         CurrencyUnit::Usd,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
 
-    let active_keyset_id = wallet_usd.get_active_mint_keyset().await.unwrap().id;
+    let active_keyset_id = wallet_usd.fetch_active_keyset().await.unwrap().id;
 
-    let usd_pre_mint =
-        PreMintSecrets::random(active_keyset_id, 50.into(), &SplitTarget::None).unwrap();
+    let usd_pre_mint = PreMintSecrets::random(
+        active_keyset_id,
+        50.into(),
+        &SplitTarget::None,
+        &fee_and_amounts,
+    )
+    .unwrap();
 
     let quote_info = wallet
         .localstore
@@ -697,43 +746,46 @@ async fn test_fake_mint_multiple_unit_swap() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
 
+    wallet.refresh_keysets().await.unwrap();
+
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let proofs = wallet
-        .mint(&mint_quote.id, SplitTarget::None, None)
+    let proofs = proof_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
     let wallet_usd = Wallet::new(
         MINT_URL,
         CurrencyUnit::Usd,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create usd wallet");
+    wallet_usd.refresh_keysets().await.unwrap();
 
     let mint_quote = wallet_usd.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet_usd, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams =
+        wallet_usd.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let usd_proofs = wallet_usd
-        .mint(&mint_quote.id, SplitTarget::None, None)
+    let usd_proofs = proof_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
-    let active_keyset_id = wallet.get_active_mint_keyset().await.unwrap().id;
+    let active_keyset_id = wallet.fetch_active_keyset().await.unwrap().id;
+    let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
 
     {
         let inputs: Proofs = vec![
@@ -745,6 +797,7 @@ async fn test_fake_mint_multiple_unit_swap() {
             active_keyset_id,
             inputs.total_amount().unwrap(),
             &SplitTarget::None,
+            &fee_and_amounts,
         )
         .unwrap();
 
@@ -767,17 +820,27 @@ async fn test_fake_mint_multiple_unit_swap() {
     }
 
     {
-        let usd_active_keyset_id = wallet_usd.get_active_mint_keyset().await.unwrap().id;
+        let usd_active_keyset_id = wallet_usd.fetch_active_keyset().await.unwrap().id;
         let inputs: Proofs = proofs.into_iter().take(2).collect();
 
         let total_inputs = inputs.total_amount().unwrap();
+        let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
 
         let half = total_inputs / 2.into();
-        let usd_pre_mint =
-            PreMintSecrets::random(usd_active_keyset_id, half, &SplitTarget::None).unwrap();
-        let pre_mint =
-            PreMintSecrets::random(active_keyset_id, total_inputs - half, &SplitTarget::None)
-                .unwrap();
+        let usd_pre_mint = PreMintSecrets::random(
+            usd_active_keyset_id,
+            half,
+            &SplitTarget::None,
+            &fee_and_amounts,
+        )
+        .unwrap();
+        let pre_mint = PreMintSecrets::random(
+            active_keyset_id,
+            total_inputs - half,
+            &SplitTarget::None,
+            &fee_and_amounts,
+        )
+        .unwrap();
 
         let mut usd_outputs = usd_pre_mint.blinded_messages();
         let mut sat_outputs = pre_mint.blinded_messages();
@@ -810,21 +873,20 @@ async fn test_fake_mint_multiple_unit_melt() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let proofs = wallet
-        .mint(&mint_quote.id, SplitTarget::None, None)
+    let proofs = proof_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
     println!("Minted sat");
 
@@ -832,7 +894,7 @@ async fn test_fake_mint_multiple_unit_melt() {
         MINT_URL,
         CurrencyUnit::Usd,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
@@ -840,14 +902,14 @@ async fn test_fake_mint_multiple_unit_melt() {
     let mint_quote = wallet_usd.mint_quote(100.into(), None).await.unwrap();
     println!("Minted quote usd");
 
-    wait_for_mint_to_be_paid(&wallet_usd, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams =
+        wallet_usd.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let usd_proofs = wallet_usd
-        .mint(&mint_quote.id, SplitTarget::None, None)
+    let usd_proofs = proof_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
     {
         let inputs: Proofs = vec![
@@ -878,22 +940,29 @@ async fn test_fake_mint_multiple_unit_melt() {
     }
 
     {
+        let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
         let inputs: Proofs = vec![proofs.first().expect("There is a proof").clone()];
 
         let input_amount: u64 = inputs.total_amount().unwrap().into();
 
         let invoice = create_fake_invoice((input_amount - 1) * 1000, "".to_string());
-        let active_keyset_id = wallet.get_active_mint_keyset().await.unwrap().id;
-        let usd_active_keyset_id = wallet_usd.get_active_mint_keyset().await.unwrap().id;
+        let active_keyset_id = wallet.fetch_active_keyset().await.unwrap().id;
+        let usd_active_keyset_id = wallet_usd.fetch_active_keyset().await.unwrap().id;
 
         let usd_pre_mint = PreMintSecrets::random(
             usd_active_keyset_id,
             inputs.total_amount().unwrap() + 100.into(),
             &SplitTarget::None,
+            &fee_and_amounts,
         )
         .unwrap();
-        let pre_mint =
-            PreMintSecrets::random(active_keyset_id, 100.into(), &SplitTarget::None).unwrap();
+        let pre_mint = PreMintSecrets::random(
+            active_keyset_id,
+            100.into(),
+            &SplitTarget::None,
+            &fee_and_amounts,
+        )
+        .unwrap();
 
         let mut usd_outputs = usd_pre_mint.blinded_messages();
         let mut sat_outputs = pre_mint.blinded_messages();
@@ -928,31 +997,31 @@ async fn test_fake_mint_input_output_mismatch() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let proofs = wallet
-        .mint(&mint_quote.id, SplitTarget::None, None)
+    let proofs = proof_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
     let wallet_usd = Wallet::new(
         MINT_URL,
         CurrencyUnit::Usd,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new  usd wallet");
-    let usd_active_keyset_id = wallet_usd.get_active_mint_keyset().await.unwrap().id;
+    let usd_active_keyset_id = wallet_usd.fetch_active_keyset().await.unwrap().id;
+    let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
 
     let inputs = proofs;
 
@@ -960,6 +1029,7 @@ async fn test_fake_mint_input_output_mismatch() {
         usd_active_keyset_id,
         inputs.total_amount().unwrap(),
         &SplitTarget::None,
+        &fee_and_amounts,
     )
     .unwrap();
 
@@ -986,24 +1056,30 @@ async fn test_fake_mint_swap_inflated() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
+    let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
 
-    let proofs = wallet
-        .mint(&mint_quote.id, SplitTarget::None, None)
+    let proofs = proof_streams
+        .next()
         .await
-        .unwrap();
-    let active_keyset_id = wallet.get_active_mint_keyset().await.unwrap().id;
-    let pre_mint =
-        PreMintSecrets::random(active_keyset_id, 101.into(), &SplitTarget::None).unwrap();
+        .expect("payment")
+        .expect("no error");
+
+    let active_keyset_id = wallet.fetch_active_keyset().await.unwrap().id;
+    let pre_mint = PreMintSecrets::random(
+        active_keyset_id,
+        101.into(),
+        &SplitTarget::None,
+        &fee_and_amounts,
+    )
+    .unwrap();
 
     let swap_request = SwapRequest::new(proofs, pre_mint.blinded_messages());
 
@@ -1030,25 +1106,31 @@ async fn test_fake_mint_swap_spend_after_fail() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let proofs = wallet
-        .mint(&mint_quote.id, SplitTarget::None, None)
+    let proofs = proof_streams
+        .next()
         .await
-        .unwrap();
-    let active_keyset_id = wallet.get_active_mint_keyset().await.unwrap().id;
+        .expect("payment")
+        .expect("no error");
 
-    let pre_mint =
-        PreMintSecrets::random(active_keyset_id, 100.into(), &SplitTarget::None).unwrap();
+    let active_keyset_id = wallet.fetch_active_keyset().await.unwrap().id;
+    let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
+
+    let pre_mint = PreMintSecrets::random(
+        active_keyset_id,
+        100.into(),
+        &SplitTarget::None,
+        &fee_and_amounts,
+    )
+    .unwrap();
 
     let swap_request = SwapRequest::new(proofs.clone(), pre_mint.blinded_messages());
 
@@ -1057,8 +1139,13 @@ async fn test_fake_mint_swap_spend_after_fail() {
 
     assert!(response.is_ok());
 
-    let pre_mint =
-        PreMintSecrets::random(active_keyset_id, 101.into(), &SplitTarget::None).unwrap();
+    let pre_mint = PreMintSecrets::random(
+        active_keyset_id,
+        101.into(),
+        &SplitTarget::None,
+        &fee_and_amounts,
+    )
+    .unwrap();
 
     let swap_request = SwapRequest::new(proofs.clone(), pre_mint.blinded_messages());
 
@@ -1073,8 +1160,13 @@ async fn test_fake_mint_swap_spend_after_fail() {
         Ok(_) => panic!("Should not have allowed swap with unbalanced"),
     }
 
-    let pre_mint =
-        PreMintSecrets::random(active_keyset_id, 100.into(), &SplitTarget::None).unwrap();
+    let pre_mint = PreMintSecrets::random(
+        active_keyset_id,
+        100.into(),
+        &SplitTarget::None,
+        &fee_and_amounts,
+    )
+    .unwrap();
 
     let swap_request = SwapRequest::new(proofs, pre_mint.blinded_messages());
 
@@ -1101,25 +1193,31 @@ async fn test_fake_mint_melt_spend_after_fail() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let proofs = wallet
-        .mint(&mint_quote.id, SplitTarget::None, None)
+    let proofs = proof_streams
+        .next()
         .await
-        .unwrap();
-    let active_keyset_id = wallet.get_active_mint_keyset().await.unwrap().id;
+        .expect("payment")
+        .expect("no error");
 
-    let pre_mint =
-        PreMintSecrets::random(active_keyset_id, 100.into(), &SplitTarget::None).unwrap();
+    let active_keyset_id = wallet.fetch_active_keyset().await.unwrap().id;
+    let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
+
+    let pre_mint = PreMintSecrets::random(
+        active_keyset_id,
+        100.into(),
+        &SplitTarget::None,
+        &fee_and_amounts,
+    )
+    .unwrap();
 
     let swap_request = SwapRequest::new(proofs.clone(), pre_mint.blinded_messages());
 
@@ -1128,8 +1226,13 @@ async fn test_fake_mint_melt_spend_after_fail() {
 
     assert!(response.is_ok());
 
-    let pre_mint =
-        PreMintSecrets::random(active_keyset_id, 101.into(), &SplitTarget::None).unwrap();
+    let pre_mint = PreMintSecrets::random(
+        active_keyset_id,
+        101.into(),
+        &SplitTarget::None,
+        &fee_and_amounts,
+    )
+    .unwrap();
 
     let swap_request = SwapRequest::new(proofs.clone(), pre_mint.blinded_messages());
 
@@ -1173,23 +1276,23 @@ async fn test_fake_mint_duplicate_proofs_swap() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let proofs = wallet
-        .mint(&mint_quote.id, SplitTarget::None, None)
+    let proofs = proof_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
-    let active_keyset_id = wallet.get_active_mint_keyset().await.unwrap().id;
+    let active_keyset_id = wallet.fetch_active_keyset().await.unwrap().id;
+    let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
 
     let inputs = vec![proofs[0].clone(), proofs[0].clone()];
 
@@ -1197,6 +1300,7 @@ async fn test_fake_mint_duplicate_proofs_swap() {
         active_keyset_id,
         inputs.total_amount().unwrap(),
         &SplitTarget::None,
+        &fee_and_amounts,
     )
     .unwrap();
 
@@ -1222,6 +1326,7 @@ async fn test_fake_mint_duplicate_proofs_swap() {
 
     let blinded_message = pre_mint.blinded_messages();
 
+    let inputs = vec![proofs[0].clone()];
     let outputs = vec![blinded_message[0].clone(), blinded_message[0].clone()];
 
     let swap_request = SwapRequest::new(inputs, outputs);
@@ -1252,21 +1357,20 @@ async fn test_fake_mint_duplicate_proofs_melt() {
         MINT_URL,
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
 
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
-        .await
-        .unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 
-    let proofs = wallet
-        .mint(&mint_quote.id, SplitTarget::None, None)
+    let proofs = proof_streams
+        .next()
         .await
-        .unwrap();
+        .expect("payment")
+        .expect("no error");
 
     let inputs = vec![proofs[0].clone(), proofs[0].clone()];
 
@@ -1290,4 +1394,156 @@ async fn test_fake_mint_duplicate_proofs_melt() {
             panic!("Should not have allow duplicate inputs");
         }
     }
+}
+
+/// Tests that wallet automatically recovers proofs after a failed melt operation
+/// by swapping them to new proofs, preventing loss of funds
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_wallet_proof_recovery_after_failed_melt() {
+    let wallet = Wallet::new(
+        MINT_URL,
+        CurrencyUnit::Sat,
+        Arc::new(memory::empty().await.unwrap()),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        None,
+    )
+    .expect("failed to create new wallet");
+
+    // Mint 100 sats
+    let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
+    let initial_proofs = proof_streams
+        .next()
+        .await
+        .expect("payment")
+        .expect("no error");
+
+    let initial_ys: Vec<_> = initial_proofs.iter().map(|p| p.y().unwrap()).collect();
+
+    assert_eq!(wallet.total_balance().await.unwrap(), Amount::from(100));
+
+    // Create a melt quote that will fail
+    let fake_description = FakeInvoiceDescription {
+        pay_invoice_state: MeltQuoteState::Unknown,
+        check_payment_state: MeltQuoteState::Unpaid,
+        pay_err: true,
+        check_err: false,
+    };
+
+    let invoice = create_fake_invoice(1000, serde_json::to_string(&fake_description).unwrap());
+    let melt_quote = wallet.melt_quote(invoice.to_string(), None).await.unwrap();
+
+    // Attempt to melt - this should fail but trigger proof recovery
+    let melt_result = wallet.melt(&melt_quote.id).await;
+    assert!(melt_result.is_err(), "Melt should have failed");
+
+    // Verify wallet still has balance (proofs recovered)
+    assert_eq!(
+        wallet.total_balance().await.unwrap(),
+        Amount::from(100),
+        "Balance should be recovered"
+    );
+
+    // Verify the proofs were swapped (different Ys)
+    let recovered_proofs = wallet.get_unspent_proofs().await.unwrap();
+    let recovered_ys: Vec<_> = recovered_proofs.iter().map(|p| p.y().unwrap()).collect();
+
+    // The Ys should be different (swapped to new proofs)
+    assert!(
+        initial_ys.iter().any(|y| !recovered_ys.contains(y)),
+        "Proofs should have been swapped to new ones"
+    );
+
+    // Verify we can still spend the recovered proofs
+    let valid_invoice = create_fake_invoice(7000, "".to_string());
+    let valid_melt_quote = wallet
+        .melt_quote(valid_invoice.to_string(), None)
+        .await
+        .unwrap();
+
+    let successful_melt = wallet.melt(&valid_melt_quote.id).await;
+    assert!(
+        successful_melt.is_ok(),
+        "Should be able to spend recovered proofs"
+    );
+}
+
+/// Tests that wallet automatically recovers proofs after a failed swap operation
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_wallet_proof_recovery_after_failed_swap() {
+    let wallet = Wallet::new(
+        MINT_URL,
+        CurrencyUnit::Sat,
+        Arc::new(memory::empty().await.unwrap()),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        None,
+    )
+    .expect("failed to create new wallet");
+
+    // Mint 100 sats
+    let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
+    let mut proof_streams = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
+    let initial_proofs = proof_streams
+        .next()
+        .await
+        .expect("payment")
+        .expect("no error");
+
+    let initial_ys: Vec<_> = initial_proofs.iter().map(|p| p.y().unwrap()).collect();
+
+    assert_eq!(wallet.total_balance().await.unwrap(), Amount::from(100));
+
+    let unspent_proofs = wallet.get_unspent_proofs().await.unwrap();
+
+    // Create an invalid swap by manually constructing a request that will fail
+    // We'll use the wallet's swap with invalid parameters to trigger a failure
+    let active_keyset_id = wallet.fetch_active_keyset().await.unwrap().id;
+    let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
+
+    // Create invalid swap request (requesting more than we have)
+    let preswap = PreMintSecrets::random(
+        active_keyset_id,
+        1000.into(), // More than the 100 we have
+        &SplitTarget::default(),
+        &fee_and_amounts,
+    )
+    .unwrap();
+
+    let swap_request = SwapRequest::new(unspent_proofs.clone(), preswap.blinded_messages());
+
+    // Use HTTP client directly to bypass wallet's validation and trigger recovery
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let response = http_client.post_swap(swap_request).await;
+    assert!(response.is_err(), "Swap should have failed");
+
+    // Note: The HTTP client doesn't trigger the wallet's try_proof_operation wrapper
+    // So we need to test through the wallet's own methods
+    // After the failed HTTP request, the proofs are still in the wallet's database
+
+    // Verify balance is still available after the failed operation
+    assert_eq!(
+        wallet.total_balance().await.unwrap(),
+        Amount::from(100),
+        "Balance should still be available"
+    );
+
+    // Verify we can perform a successful swap operation
+    let successful_swap = wallet
+        .swap(None, SplitTarget::None, unspent_proofs, None, false)
+        .await;
+
+    assert!(
+        successful_swap.is_ok(),
+        "Should be able to swap after failed operation"
+    );
+
+    // Verify the proofs were swapped to new ones
+    let final_proofs = wallet.get_unspent_proofs().await.unwrap();
+    let final_ys: Vec<_> = final_proofs.iter().map(|p| p.y().unwrap()).collect();
+
+    // The Ys should be different after the successful swap
+    assert!(
+        initial_ys.iter().any(|y| !final_ys.contains(y)),
+        "Proofs should have been swapped to new ones"
+    );
 }

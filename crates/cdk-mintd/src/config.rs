@@ -4,14 +4,55 @@ use bitcoin::hashes::{sha256, Hash};
 use cdk::nuts::{CurrencyUnit, PublicKey};
 use cdk::Amount;
 use cdk_axum::cache;
+use cdk_common::common::QuoteTTL;
 use config::{Config, ConfigError, File};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LoggingOutput {
+    /// Log to stderr only
+    Stderr,
+    /// Log to file only
+    File,
+    /// Log to both stderr and file (default)
+    #[default]
+    Both,
+}
+
+impl std::str::FromStr for LoggingOutput {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "stderr" => Ok(LoggingOutput::Stderr),
+            "file" => Ok(LoggingOutput::File),
+            "both" => Ok(LoggingOutput::Both),
+            _ => Err(format!(
+                "Unknown logging output: {s}. Valid options: stdout, file, both"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LoggingConfig {
+    /// Where to output logs: stdout, file, or both
+    #[serde(default)]
+    pub output: LoggingOutput,
+    /// Log level for console output (when stdout or both)
+    pub console_level: Option<String>,
+    /// Log level for file output (when file or both)
+    pub file_level: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Info {
     pub url: String,
     pub listen_host: String,
     pub listen_port: u16,
+    /// Overrides mnemonic
+    pub seed: Option<String>,
     pub mnemonic: Option<String>,
     pub signatory_url: Option<String>,
     pub signatory_certs: Option<String>,
@@ -19,17 +60,46 @@ pub struct Info {
 
     pub http_cache: cache::Config,
 
+    /// Logging configuration
+    #[serde(default)]
+    pub logging: LoggingConfig,
+
     /// When this is set to true, the mint exposes a Swagger UI for it's API at
     /// `[listen_host]:[listen_port]/swagger-ui`
     ///
     /// This requires `mintd` was built with the `swagger` feature flag.
     pub enable_swagger_ui: Option<bool>,
+
+    /// Optional persisted quote TTL values (seconds) to initialize the database with
+    /// when RPC is disabled or on first-run when RPC is enabled.
+    /// If not provided, defaults are used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_ttl: Option<QuoteTTL>,
+}
+
+impl Default for Info {
+    fn default() -> Self {
+        Info {
+            url: String::new(),
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: 8091, // Default to port 8091 instead of 0
+            seed: None,
+            mnemonic: None,
+            signatory_url: None,
+            signatory_certs: None,
+            input_fee_ppk: None,
+            http_cache: cache::Config::default(),
+            enable_swagger_ui: None,
+            logging: LoggingConfig::default(),
+            quote_ttl: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for Info {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Use a fallback approach that won't panic
-        let mnemonic_display = {
+        let mnemonic_display: String = {
             if let Some(mnemonic) = self.mnemonic.as_ref() {
                 let hash = sha256::Hash::hash(mnemonic.as_bytes());
                 format!("<hashed: {hash}>")
@@ -45,6 +115,7 @@ impl std::fmt::Debug for Info {
             .field("mnemonic", &mnemonic_display)
             .field("input_fee_ppk", &self.input_fee_ppk)
             .field("http_cache", &self.http_cache)
+            .field("logging", &self.logging)
             .field("enable_swagger_ui", &self.enable_swagger_ui)
             .finish()
     }
@@ -63,6 +134,8 @@ pub enum LnBackend {
     FakeWallet,
     #[cfg(feature = "lnd")]
     Lnd,
+    #[cfg(feature = "ldk-node")]
+    LdkNode,
     #[cfg(feature = "grpc-processor")]
     GrpcProcessor,
 }
@@ -80,6 +153,8 @@ impl std::str::FromStr for LnBackend {
             "fakewallet" => Ok(LnBackend::FakeWallet),
             #[cfg(feature = "lnd")]
             "lnd" => Ok(LnBackend::Lnd),
+            #[cfg(feature = "ldk-node")]
+            "ldk-node" | "ldknode" => Ok(LnBackend::LdkNode),
             #[cfg(feature = "grpc-processor")]
             "grpcprocessor" => Ok(LnBackend::GrpcProcessor),
             _ => Err(format!("Unknown Lightning backend: {s}")),
@@ -118,7 +193,6 @@ pub struct LNbits {
     pub lnbits_api: String,
     pub fee_percent: f32,
     pub reserve_fee_min: Amount,
-    pub retro_api: bool,
 }
 
 #[cfg(feature = "cln")]
@@ -139,6 +213,88 @@ pub struct Lnd {
     pub macaroon_file: PathBuf,
     pub fee_percent: f32,
     pub reserve_fee_min: Amount,
+}
+
+#[cfg(feature = "ldk-node")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LdkNode {
+    /// Fee percentage (e.g., 0.02 for 2%)
+    #[serde(default = "default_ldk_fee_percent")]
+    pub fee_percent: f32,
+    /// Minimum reserve fee
+    #[serde(default = "default_ldk_reserve_fee_min")]
+    pub reserve_fee_min: Amount,
+    /// Bitcoin network (mainnet, testnet, signet, regtest)
+    pub bitcoin_network: Option<String>,
+    /// Chain source type (esplora or bitcoinrpc)
+    pub chain_source_type: Option<String>,
+    /// Esplora URL (when chain_source_type = "esplora")
+    pub esplora_url: Option<String>,
+    /// Bitcoin RPC configuration (when chain_source_type = "bitcoinrpc")
+    pub bitcoind_rpc_host: Option<String>,
+    pub bitcoind_rpc_port: Option<u16>,
+    pub bitcoind_rpc_user: Option<String>,
+    pub bitcoind_rpc_password: Option<String>,
+    /// Storage directory path
+    pub storage_dir_path: Option<String>,
+    /// LDK node listening host
+    pub ldk_node_host: Option<String>,
+    /// LDK node listening port
+    pub ldk_node_port: Option<u16>,
+    /// Gossip source type (p2p or rgs)
+    pub gossip_source_type: Option<String>,
+    /// Rapid Gossip Sync URL (when gossip_source_type = "rgs")
+    pub rgs_url: Option<String>,
+    /// Webserver host (defaults to 127.0.0.1)
+    #[serde(default = "default_webserver_host")]
+    pub webserver_host: Option<String>,
+    /// Webserver port
+    #[serde(default = "default_webserver_port")]
+    pub webserver_port: Option<u16>,
+}
+
+#[cfg(feature = "ldk-node")]
+impl Default for LdkNode {
+    fn default() -> Self {
+        Self {
+            fee_percent: default_ldk_fee_percent(),
+            reserve_fee_min: default_ldk_reserve_fee_min(),
+            bitcoin_network: None,
+            chain_source_type: None,
+            esplora_url: None,
+            bitcoind_rpc_host: None,
+            bitcoind_rpc_port: None,
+            bitcoind_rpc_user: None,
+            bitcoind_rpc_password: None,
+            storage_dir_path: None,
+            ldk_node_host: None,
+            ldk_node_port: None,
+            gossip_source_type: None,
+            rgs_url: None,
+            webserver_host: default_webserver_host(),
+            webserver_port: default_webserver_port(),
+        }
+    }
+}
+
+#[cfg(feature = "ldk-node")]
+fn default_ldk_fee_percent() -> f32 {
+    0.04
+}
+
+#[cfg(feature = "ldk-node")]
+fn default_ldk_reserve_fee_min() -> Amount {
+    4.into()
+}
+
+#[cfg(feature = "ldk-node")]
+fn default_webserver_host() -> Option<String> {
+    Some("127.0.0.1".to_string())
+}
+
+#[cfg(feature = "ldk-node")]
+fn default_webserver_port() -> Option<u16> {
+    Some(8091)
 }
 
 #[cfg(feature = "fakewallet")]
@@ -190,6 +346,7 @@ pub struct GrpcProcessor {
 pub enum DatabaseEngine {
     #[default]
     Sqlite,
+    Postgres,
 }
 
 impl std::str::FromStr for DatabaseEngine {
@@ -198,6 +355,7 @@ impl std::str::FromStr for DatabaseEngine {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "sqlite" => Ok(DatabaseEngine::Sqlite),
+            "postgres" => Ok(DatabaseEngine::Postgres),
             _ => Err(format!("Unknown database engine: {s}")),
         }
     }
@@ -206,32 +364,108 @@ impl std::str::FromStr for DatabaseEngine {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Database {
     pub engine: DatabaseEngine,
+    pub postgres: Option<PostgresConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AuthDatabase {
+    pub postgres: Option<PostgresAuthConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostgresAuthConfig {
+    pub url: String,
+    pub tls_mode: Option<String>,
+    pub max_connections: Option<usize>,
+    pub connection_timeout_seconds: Option<u64>,
+}
+
+impl Default for PostgresAuthConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            tls_mode: Some("disable".to_string()),
+            max_connections: Some(20),
+            connection_timeout_seconds: Some(10),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostgresConfig {
+    pub url: String,
+    pub tls_mode: Option<String>,
+    pub max_connections: Option<usize>,
+    pub connection_timeout_seconds: Option<u64>,
+}
+
+impl Default for PostgresConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            tls_mode: Some("disable".to_string()),
+            max_connections: Some(20),
+            connection_timeout_seconds: Some(10),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthType {
+    Clear,
+    Blind,
+    #[default]
+    None,
+}
+
+impl std::str::FromStr for AuthType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "clear" => Ok(AuthType::Clear),
+            "blind" => Ok(AuthType::Blind),
+            "none" => Ok(AuthType::None),
+            _ => Err(format!("Unknown auth type: {s}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Auth {
+    #[serde(default)]
+    pub auth_enabled: bool,
     pub openid_discovery: String,
     pub openid_client_id: String,
     pub mint_max_bat: u64,
-    #[serde(default = "default_true")]
-    pub enabled_mint: bool,
-    #[serde(default = "default_true")]
-    pub enabled_melt: bool,
-    #[serde(default = "default_true")]
-    pub enabled_swap: bool,
-    #[serde(default = "default_true")]
-    pub enabled_check_mint_quote: bool,
-    #[serde(default = "default_true")]
-    pub enabled_check_melt_quote: bool,
-    #[serde(default = "default_true")]
-    pub enabled_restore: bool,
-    #[serde(default = "default_true")]
-    pub enabled_check_proof_state: bool,
+    #[serde(default = "default_blind")]
+    pub mint: AuthType,
+    #[serde(default)]
+    pub get_mint_quote: AuthType,
+    #[serde(default)]
+    pub check_mint_quote: AuthType,
+    #[serde(default)]
+    pub melt: AuthType,
+    #[serde(default)]
+    pub get_melt_quote: AuthType,
+    #[serde(default)]
+    pub check_melt_quote: AuthType,
+    #[serde(default = "default_blind")]
+    pub swap: AuthType,
+    #[serde(default = "default_blind")]
+    pub restore: AuthType,
+    #[serde(default)]
+    pub check_proof_state: AuthType,
+    /// Enable WebSocket authentication support
+    #[serde(default = "default_blind")]
+    pub websocket_auth: AuthType,
 }
 
-fn default_true() -> bool {
-    true
+fn default_blind() -> AuthType {
+    AuthType::Blind
 }
+
 /// CDK settings, derived from `config.toml`
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
@@ -244,13 +478,27 @@ pub struct Settings {
     pub lnbits: Option<LNbits>,
     #[cfg(feature = "lnd")]
     pub lnd: Option<Lnd>,
+    #[cfg(feature = "ldk-node")]
+    pub ldk_node: Option<LdkNode>,
     #[cfg(feature = "fakewallet")]
     pub fake_wallet: Option<FakeWallet>,
     pub grpc_processor: Option<GrpcProcessor>,
     pub database: Database,
+    #[cfg(feature = "auth")]
+    pub auth_database: Option<AuthDatabase>,
     #[cfg(feature = "management-rpc")]
     pub mint_management_rpc: Option<MintManagementRpc>,
     pub auth: Option<Auth>,
+    #[cfg(feature = "prometheus")]
+    pub prometheus: Option<Prometheus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg(feature = "prometheus")]
+pub struct Prometheus {
+    pub enabled: bool,
+    pub address: Option<String>,
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -348,6 +596,13 @@ impl Settings {
                 assert!(
                     settings.lnd.is_some(),
                     "LND backend requires a valid config."
+                )
+            }
+            #[cfg(feature = "ldk-node")]
+            LnBackend::LdkNode => {
+                assert!(
+                    settings.ldk_node.is_some(),
+                    "LDK Node backend requires a valid config."
                 )
             }
             #[cfg(feature = "fakewallet")]

@@ -3,6 +3,7 @@
 use std::fmt::Debug;
 
 use async_trait::async_trait;
+use cdk_common::{MeltQuoteBolt12Request, MintQuoteBolt12Request, MintQuoteBolt12Response};
 
 use super::Error;
 use crate::nuts::{
@@ -14,13 +15,19 @@ use crate::nuts::{
 #[cfg(feature = "auth")]
 use crate::wallet::AuthWallet;
 
-mod http_client;
+pub mod http_client;
+pub mod transport;
 #[cfg(feature = "tor")]
 mod http_client_tor;
 
+/// Auth HTTP Client with async transport
 #[cfg(feature = "auth")]
-pub use http_client::AuthHttpClient;
-pub use http_client::HttpClient;
+pub type AuthHttpClient = http_client::AuthHttpClient<transport::Async>;
+/// Default Http Client with async transport (non-Tor)
+pub type HttpClient = http_client::HttpClient<transport::Async>;
+/// Tor Http Client with async transport (only when `tor` feature is enabled and not on wasm32)
+#[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
+pub type TorHttpClient = http_client::HttpClient<transport::tor_transport::TorAsync>;
 #[cfg(feature = "tor")]
 pub use http_client_tor::{
     TorPolicy, TorConfig, HttpClientTor,
@@ -31,6 +38,10 @@ pub use http_client_tor::{
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait MintConnector: Debug {
+    #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
+    /// Resolve the DNS record getting the TXT value
+    async fn resolve_dns_txt(&self, _domain: &str) -> Result<Vec<String>, Error>;
+
     /// Get Active Mint Keys [NUT-01]
     async fn get_mint_keys(&self) -> Result<Vec<KeySet>, Error>;
     /// Get Keyset Keys [NUT-01]
@@ -84,4 +95,29 @@ pub trait MintConnector: Debug {
     /// Set auth wallet on client
     #[cfg(feature = "auth")]
     async fn set_auth_wallet(&self, wallet: Option<AuthWallet>);
+    /// Mint Quote [NUT-04]
+    async fn post_mint_bolt12_quote(
+        &self,
+        request: MintQuoteBolt12Request,
+    ) -> Result<MintQuoteBolt12Response<String>, Error>;
+    /// Mint Quote status
+    async fn get_mint_quote_bolt12_status(
+        &self,
+        quote_id: &str,
+    ) -> Result<MintQuoteBolt12Response<String>, Error>;
+    /// Melt Quote [NUT-23]
+    async fn post_melt_bolt12_quote(
+        &self,
+        request: MeltQuoteBolt12Request,
+    ) -> Result<MeltQuoteBolt11Response<String>, Error>;
+    /// Melt Quote Status [NUT-23]
+    async fn get_melt_bolt12_quote_status(
+        &self,
+        quote_id: &str,
+    ) -> Result<MeltQuoteBolt11Response<String>, Error>;
+    /// Melt [NUT-23]
+    async fn post_melt_bolt12(
+        &self,
+        request: MeltRequest<String>,
+    ) -> Result<MeltQuoteBolt11Response<String>, Error>;
 }

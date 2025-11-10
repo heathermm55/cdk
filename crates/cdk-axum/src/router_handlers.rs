@@ -4,6 +4,7 @@ use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use cdk::error::{ErrorCode, ErrorResponse};
+use cdk::mint::QuoteId;
 #[cfg(feature = "auth")]
 use cdk::nuts::nut21::{Method, ProtectedEndpoint, RoutePath};
 use cdk::nuts::{
@@ -15,13 +16,14 @@ use cdk::nuts::{
 use cdk::util::unix_time;
 use paste::paste;
 use tracing::instrument;
-use uuid::Uuid;
 
 #[cfg(feature = "auth")]
 use crate::auth::AuthHeader;
 use crate::ws::main_websocket;
 use crate::MintState;
 
+/// Macro to add cache to endpoint
+#[macro_export]
 macro_rules! post_cache_wrapper {
     ($handler:ident, $request_type:ty, $response_type:ty) => {
         paste! {
@@ -60,11 +62,11 @@ macro_rules! post_cache_wrapper {
 }
 
 post_cache_wrapper!(post_swap, SwapRequest, SwapResponse);
-post_cache_wrapper!(post_mint_bolt11, MintRequest<Uuid>, MintResponse);
+post_cache_wrapper!(post_mint_bolt11, MintRequest<QuoteId>, MintResponse);
 post_cache_wrapper!(
     post_melt_bolt11,
-    MeltRequest<Uuid>,
-    MeltQuoteBolt11Response<Uuid>
+    MeltRequest<QuoteId>,
+    MeltQuoteBolt11Response<QuoteId>
 );
 
 #[cfg_attr(feature = "swagger", utoipa::path(
@@ -150,7 +152,7 @@ pub(crate) async fn post_mint_bolt11_quote(
     #[cfg(feature = "auth")] auth: AuthHeader,
     State(state): State<MintState>,
     Json(payload): Json<MintQuoteBolt11Request>,
-) -> Result<Json<MintQuoteBolt11Response<Uuid>>, Response> {
+) -> Result<Json<MintQuoteBolt11Response<QuoteId>>, Response> {
     #[cfg(feature = "auth")]
     state
         .mint
@@ -163,11 +165,11 @@ pub(crate) async fn post_mint_bolt11_quote(
 
     let quote = state
         .mint
-        .get_mint_bolt11_quote(payload)
+        .get_mint_quote(payload.into())
         .await
         .map_err(into_response)?;
 
-    Ok(Json(quote))
+    Ok(Json(quote.try_into().map_err(into_response)?))
 }
 
 #[cfg_attr(feature = "swagger", utoipa::path(
@@ -189,8 +191,8 @@ pub(crate) async fn post_mint_bolt11_quote(
 pub(crate) async fn get_check_mint_bolt11_quote(
     #[cfg(feature = "auth")] auth: AuthHeader,
     State(state): State<MintState>,
-    Path(quote_id): Path<Uuid>,
-) -> Result<Json<MintQuoteBolt11Response<Uuid>>, Response> {
+    Path(quote_id): Path<QuoteId>,
+) -> Result<Json<MintQuoteBolt11Response<QuoteId>>, Response> {
     #[cfg(feature = "auth")]
     {
         state
@@ -212,15 +214,28 @@ pub(crate) async fn get_check_mint_bolt11_quote(
             into_response(err)
         })?;
 
-    Ok(Json(quote))
+    Ok(Json(quote.try_into().map_err(into_response)?))
 }
 
 #[instrument(skip_all)]
 pub(crate) async fn ws_handler(
+    #[cfg(feature = "auth")] auth: AuthHeader,
     State(state): State<MintState>,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.on_upgrade(|ws| main_websocket(ws, state))
+) -> Result<impl IntoResponse, Response> {
+    #[cfg(feature = "auth")]
+    {
+        state
+            .mint
+            .verify_auth(
+                auth.into(),
+                &ProtectedEndpoint::new(Method::Get, RoutePath::Ws),
+            )
+            .await
+            .map_err(into_response)?;
+    }
+
+    Ok(ws.on_upgrade(|ws| main_websocket(ws, state)))
 }
 
 /// Mint tokens by paying a BOLT11 Lightning invoice.
@@ -242,7 +257,7 @@ pub(crate) async fn ws_handler(
 pub(crate) async fn post_mint_bolt11(
     #[cfg(feature = "auth")] auth: AuthHeader,
     State(state): State<MintState>,
-    Json(payload): Json<MintRequest<Uuid>>,
+    Json(payload): Json<MintRequest<QuoteId>>,
 ) -> Result<Json<MintResponse>, Response> {
     #[cfg(feature = "auth")]
     {
@@ -284,7 +299,7 @@ pub(crate) async fn post_melt_bolt11_quote(
     #[cfg(feature = "auth")] auth: AuthHeader,
     State(state): State<MintState>,
     Json(payload): Json<MeltQuoteBolt11Request>,
-) -> Result<Json<MeltQuoteBolt11Response<Uuid>>, Response> {
+) -> Result<Json<MeltQuoteBolt11Response<QuoteId>>, Response> {
     #[cfg(feature = "auth")]
     {
         state
@@ -299,7 +314,7 @@ pub(crate) async fn post_melt_bolt11_quote(
 
     let quote = state
         .mint
-        .get_melt_bolt11_quote(&payload)
+        .get_melt_quote(payload.into())
         .await
         .map_err(into_response)?;
 
@@ -325,8 +340,8 @@ pub(crate) async fn post_melt_bolt11_quote(
 pub(crate) async fn get_check_melt_bolt11_quote(
     #[cfg(feature = "auth")] auth: AuthHeader,
     State(state): State<MintState>,
-    Path(quote_id): Path<Uuid>,
-) -> Result<Json<MeltQuoteBolt11Response<Uuid>>, Response> {
+    Path(quote_id): Path<QuoteId>,
+) -> Result<Json<MeltQuoteBolt11Response<QuoteId>>, Response> {
     #[cfg(feature = "auth")]
     {
         state
@@ -368,8 +383,8 @@ pub(crate) async fn get_check_melt_bolt11_quote(
 pub(crate) async fn post_melt_bolt11(
     #[cfg(feature = "auth")] auth: AuthHeader,
     State(state): State<MintState>,
-    Json(payload): Json<MeltRequest<Uuid>>,
-) -> Result<Json<MeltQuoteBolt11Response<Uuid>>, Response> {
+    Json(payload): Json<MeltRequest<QuoteId>>,
+) -> Result<Json<MeltQuoteBolt11Response<QuoteId>>, Response> {
     #[cfg(feature = "auth")]
     {
         state
@@ -382,11 +397,7 @@ pub(crate) async fn post_melt_bolt11(
             .map_err(into_response)?;
     }
 
-    let res = state
-        .mint
-        .melt_bolt11(&payload)
-        .await
-        .map_err(into_response)?;
+    let res = state.mint.melt(&payload).await.map_err(into_response)?;
 
     Ok(Json(res))
 }
@@ -563,6 +574,7 @@ where
         | ErrorCode::TransactionUnbalanced
         | ErrorCode::AmountOutofLimitRange
         | ErrorCode::WitnessMissingOrInvalid
+        | ErrorCode::DuplicateSignature
         | ErrorCode::DuplicateInputs
         | ErrorCode::DuplicateOutputs
         | ErrorCode::MultipleUnits

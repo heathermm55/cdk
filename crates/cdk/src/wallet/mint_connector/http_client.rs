@@ -1,20 +1,21 @@
-#[cfg(feature = "auth")]
-use std::sync::Arc;
+//! HTTP Mint client with pluggable transport
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use async_trait::async_trait;
+use cdk_common::{nut19, MeltQuoteBolt12Request, MintQuoteBolt12Request, MintQuoteBolt12Response};
 #[cfg(feature = "auth")]
 use cdk_common::{Method, ProtectedEndpoint, RoutePath};
-use reqwest::{Client, IntoUrl};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 #[cfg(feature = "auth")]
 use tokio::sync::RwLock;
 use tracing::instrument;
-#[cfg(not(target_arch = "wasm32"))]
 use url::Url;
+use web_time::{Duration, Instant};
 
+use super::transport::Transport;
 use super::{Error, MintConnector};
-use crate::error::ErrorResponse;
 use crate::mint_url::MintUrl;
 #[cfg(feature = "auth")]
 use crate::nuts::nut22::MintAuthRequest;
@@ -27,178 +28,75 @@ use crate::nuts::{
 #[cfg(feature = "auth")]
 use crate::wallet::auth::{AuthMintConnector, AuthWallet};
 
-/// Check if the URL is a local network address
-fn is_local_network(mint_url: &MintUrl) -> bool {
-    let url_str = mint_url.to_string();
-    
-    // Check for localhost
-    if url_str.contains("localhost") || url_str.contains("127.0.0.1") {
-        return true;
-    }
-    
-    // Check for private IP ranges
-    // Extract host from URL string
-    if let Some(host_part) = url_str.split("://").nth(1) {
-        let host = host_part.split(':').next().unwrap_or(host_part).split('/').next().unwrap_or(host_part);
-        
-        // Try to parse as IP address
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            match ip {
-                std::net::IpAddr::V4(ipv4) => {
-                    let octets = ipv4.octets();
-                    // 192.168.x.x
-                    if octets[0] == 192 && octets[1] == 168 {
-                        return true;
-                    }
-                    // 10.x.x.x
-                    if octets[0] == 10 {
-                        return true;
-                    }
-                    // 172.16.x.x to 172.31.x.x
-                    if octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31 {
-                        return true;
-                    }
-                }
-                std::net::IpAddr::V6(ipv6) => {
-                    // Check for IPv6 localhost
-                    if ipv6.is_loopback() {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    
-    false
-}
-
-#[derive(Debug, Clone)]
-struct HttpClientCore {
-    inner: Client,
-}
-
-impl HttpClientCore {
-    fn new(mint_url: &MintUrl) -> Result<Self, Error> {
-        #[cfg(not(target_arch = "wasm32"))]
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
-
-        // Check if this is a local network address
-        let is_local = is_local_network(mint_url);
-        
-        let client = if is_local {
-            // For local network addresses, accept invalid certificates
-            tracing::debug!("Local network address detected ({}), accepting invalid certificates", mint_url);
-            Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build()
-                .map_err(|e| Error::HttpError(e.to_string()))?
-        } else {
-            // For public addresses, use normal certificate verification
-            Client::new()
-        };
-
-        Ok(Self { inner: client })
-    }
-
-    fn client(&self) -> &Client {
-        &self.inner
-    }
-
-    async fn http_get<U: IntoUrl + Send, R: DeserializeOwned>(
-        &self,
-        url: U,
-        auth: Option<AuthToken>,
-    ) -> Result<R, Error> {
-        let mut request = self.client().get(url);
-
-        if let Some(auth) = auth {
-            request = request.header(auth.header_key(), auth.to_string());
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::HttpError(e.to_string()))?
-            .text()
-            .await
-            .map_err(|e| Error::HttpError(e.to_string()))?;
-
-        serde_json::from_str::<R>(&response).map_err(|err| {
-            tracing::warn!("Http Response error: {}", err);
-            match ErrorResponse::from_json(&response) {
-                Ok(ok) => <ErrorResponse as Into<Error>>::into(ok),
-                Err(err) => err.into(),
-            }
-        })
-    }
-
-    async fn http_post<U: IntoUrl + Send, P: Serialize + ?Sized, R: DeserializeOwned>(
-        &self,
-        url: U,
-        auth_token: Option<AuthToken>,
-        payload: &P,
-    ) -> Result<R, Error> {
-        let mut request = self.client().post(url).json(&payload);
-
-        if let Some(auth) = auth_token {
-            request = request.header(auth.header_key(), auth.to_string());
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::HttpError(e.to_string()))?
-            .text()
-            .await
-            .map_err(|e| Error::HttpError(e.to_string()))?;
-
-        serde_json::from_str::<R>(&response).map_err(|err| {
-            tracing::warn!("Http Response error: {}", err);
-            match ErrorResponse::from_json(&response) {
-                Ok(ok) => <ErrorResponse as Into<Error>>::into(ok),
-                Err(err) => err.into(),
-            }
-        })
-    }
-}
+type Cache = (u64, HashSet<(nut19::Method, nut19::Path)>);
 
 /// Http Client
 #[derive(Debug, Clone)]
-pub struct HttpClient {
-    core: HttpClientCore,
+pub struct HttpClient<T>
+where
+    T: Transport + Send + Sync + 'static,
+{
+    transport: Arc<T>,
     mint_url: MintUrl,
+    cache_support: Arc<StdRwLock<Cache>>,
     #[cfg(feature = "auth")]
     auth_wallet: Arc<RwLock<Option<AuthWallet>>>,
 }
 
-impl HttpClient {
-    /// Create new [`HttpClient`]
+impl<T> HttpClient<T>
+where
+    T: Transport + Send + Sync + 'static,
+{
+    /// Create new [`HttpClient`] with a provided transport implementation.
     #[cfg(feature = "auth")]
-    pub fn new(mint_url: MintUrl, auth_wallet: Option<AuthWallet>) -> Result<Self, Error> {
-        let core = HttpClientCore::new(&mint_url)?;
-        Ok(Self {
-            core,
+    pub fn with_transport(
+        mint_url: MintUrl,
+        transport: T,
+        auth_wallet: Option<AuthWallet>,
+    ) -> Self {
+        Self {
+            transport: transport.into(),
             mint_url,
             auth_wallet: Arc::new(RwLock::new(auth_wallet)),
-        })
+            cache_support: Default::default(),
+        }
+    }
+
+    /// Create new [`HttpClient`] with a provided transport implementation.
+    #[cfg(not(feature = "auth"))]
+    pub fn with_transport(mint_url: MintUrl, transport: T) -> Self {
+        Self {
+            transport: transport.into(),
+            mint_url,
+            cache_support: Default::default(),
+        }
+    }
+
+    /// Create new [`HttpClient`]
+    #[cfg(feature = "auth")]
+    pub fn new(mint_url: MintUrl, auth_wallet: Option<AuthWallet>) -> Self {
+        Self {
+            transport: T::default().into(),
+            mint_url,
+            auth_wallet: Arc::new(RwLock::new(auth_wallet)),
+            cache_support: Default::default(),
+        }
     }
 
     #[cfg(not(feature = "auth"))]
     /// Create new [`HttpClient`]
-    pub fn new(mint_url: MintUrl) -> Result<Self, Error> {
-        let core = HttpClientCore::new(&mint_url)?;
-        Ok(Self {
-            core,
+    pub fn new(mint_url: MintUrl) -> Self {
+        Self {
+            transport: T::default().into(),
+            cache_support: Default::default(),
             mint_url,
-        })
+        }
     }
 
     /// Get auth token for a protected endpoint
     #[cfg(feature = "auth")]
     #[instrument(skip(self))]
-    async fn get_auth_token(
+    pub async fn get_auth_token(
         &self,
         method: Method,
         path: RoutePath,
@@ -213,7 +111,6 @@ impl HttpClient {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     /// Create new [`HttpClient`] with a proxy for specific TLDs.
     /// Specifying `None` for `host_matcher` will use the proxy for all
     /// requests.
@@ -223,47 +120,109 @@ impl HttpClient {
         host_matcher: Option<&str>,
         accept_invalid_certs: bool,
     ) -> Result<Self, Error> {
-        let regex = host_matcher
-            .map(regex::Regex::new)
-            .transpose()
-            .map_err(|e| Error::Custom(e.to_string()))?;
-        let client = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::custom(move |url| {
-                if let Some(matcher) = regex.as_ref() {
-                    if let Some(host) = url.host_str() {
-                        if matcher.is_match(host) {
-                            return Some(proxy.clone());
-                        }
-                    }
-                }
-                None
-            }))
-            .danger_accept_invalid_certs(accept_invalid_certs) // Allow self-signed certs
-            .build()
-            .map_err(|e| Error::HttpError(e.to_string()))?;
+        let mut transport = T::default();
+        transport.with_proxy(proxy, host_matcher, accept_invalid_certs)?;
 
         Ok(Self {
-            core: HttpClientCore { inner: client },
+            transport: transport.into(),
             mint_url,
             #[cfg(feature = "auth")]
             auth_wallet: Arc::new(RwLock::new(None)),
+            cache_support: Default::default(),
         })
+    }
+
+    /// Generic implementation of a retriable http request
+    ///
+    /// The retry only happens if the mint supports replay through the Caching of NUT-19.
+    #[inline(always)]
+    async fn retriable_http_request<P, R>(
+        &self,
+        method: nut19::Method,
+        path: nut19::Path,
+        auth_token: Option<AuthToken>,
+        payload: &P,
+    ) -> Result<R, Error>
+    where
+        P: Serialize + ?Sized + Send + Sync,
+        R: DeserializeOwned,
+    {
+        let started = Instant::now();
+
+        let retriable_window = self
+            .cache_support
+            .read()
+            .map(|cache_support| {
+                cache_support
+                    .1
+                    .get(&(method, path))
+                    .map(|_| cache_support.0)
+            })
+            .unwrap_or_default()
+            .map(Duration::from_secs)
+            .unwrap_or_default();
+
+        let transport = self.transport.clone();
+        loop {
+            let url = self.mint_url.join_paths(&match path {
+                nut19::Path::MintBolt11 => vec!["v1", "mint", "bolt11"],
+                nut19::Path::MeltBolt11 => vec!["v1", "melt", "bolt11"],
+                nut19::Path::MintBolt12 => vec!["v1", "mint", "bolt12"],
+
+                nut19::Path::MeltBolt12 => vec!["v1", "melt", "bolt12"],
+                nut19::Path::Swap => vec!["v1", "swap"],
+            })?;
+
+            let result = match method {
+                nut19::Method::Get => transport.http_get(url, auth_token.clone()).await,
+                nut19::Method::Post => transport.http_post(url, auth_token.clone(), payload).await,
+            };
+
+            if result.is_ok() {
+                return result;
+            }
+
+            match result.as_ref() {
+                Err(Error::HttpError(status_code, _)) => {
+                    let status_code = status_code.to_owned().unwrap_or_default();
+                    if (400..=499).contains(&status_code) {
+                        // 4xx errors won't be 'solved' by retrying
+                        return result;
+                    }
+
+                    // retry request, if possible
+                    tracing::error!("Failed http_request {:?}", result.as_ref().err());
+
+                    if retriable_window < started.elapsed() {
+                        return result;
+                    }
+                }
+                Err(_) => return result,
+                _ => unreachable!(),
+            };
+        }
     }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl MintConnector for HttpClient {
+impl<T> MintConnector for HttpClient<T>
+where
+    T: Transport + Send + Sync + 'static,
+{
+    #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
+    #[instrument(skip(self), fields(mint_url = %self.mint_url))]
+    async fn resolve_dns_txt(&self, domain: &str) -> Result<Vec<String>, Error> {
+        self.transport.resolve_dns_txt(domain).await
+    }
+
     /// Get Active Mint Keys [NUT-01]
     #[instrument(skip(self), fields(mint_url = %self.mint_url))]
     async fn get_mint_keys(&self) -> Result<Vec<KeySet>, Error> {
         let url = self.mint_url.join_paths(&["v1", "keys"])?;
+        let transport = self.transport.clone();
 
-        Ok(self
-            .core
-            .http_get::<_, KeysResponse>(url, None)
-            .await?
-            .keysets)
+        Ok(transport.http_get::<KeysResponse>(url, None).await?.keysets)
     }
 
     /// Get Keyset Keys [NUT-01]
@@ -273,7 +232,8 @@ impl MintConnector for HttpClient {
             .mint_url
             .join_paths(&["v1", "keys", &keyset_id.to_string()])?;
 
-        let keys_response = self.core.http_get::<_, KeysResponse>(url, None).await?;
+        let transport = self.transport.clone();
+        let keys_response = transport.http_get::<KeysResponse>(url, None).await?;
 
         Ok(keys_response.keysets.first().unwrap().clone())
     }
@@ -282,7 +242,8 @@ impl MintConnector for HttpClient {
     #[instrument(skip(self), fields(mint_url = %self.mint_url))]
     async fn get_mint_keysets(&self) -> Result<KeysetResponse, Error> {
         let url = self.mint_url.join_paths(&["v1", "keysets"])?;
-        self.core.http_get(url, None).await
+        let transport = self.transport.clone();
+        transport.http_get(url, None).await
     }
 
     /// Mint Quote [NUT-04]
@@ -303,7 +264,7 @@ impl MintConnector for HttpClient {
         #[cfg(not(feature = "auth"))]
         let auth_token = None;
 
-        self.core.http_post(url, auth_token, &request).await
+        self.transport.http_post(url, auth_token, &request).await
     }
 
     /// Mint Quote status
@@ -323,13 +284,12 @@ impl MintConnector for HttpClient {
 
         #[cfg(not(feature = "auth"))]
         let auth_token = None;
-        self.core.http_get(url, auth_token).await
+        self.transport.http_get(url, auth_token).await
     }
 
     /// Mint Tokens [NUT-04]
     #[instrument(skip(self, request), fields(mint_url = %self.mint_url))]
     async fn post_mint(&self, request: MintRequest<String>) -> Result<MintResponse, Error> {
-        let url = self.mint_url.join_paths(&["v1", "mint", "bolt11"])?;
         #[cfg(feature = "auth")]
         let auth_token = self
             .get_auth_token(Method::Post, RoutePath::MintBolt11)
@@ -337,7 +297,13 @@ impl MintConnector for HttpClient {
 
         #[cfg(not(feature = "auth"))]
         let auth_token = None;
-        self.core.http_post(url, auth_token, &request).await
+        self.retriable_http_request(
+            nut19::Method::Post,
+            nut19::Path::MintBolt11,
+            auth_token,
+            &request,
+        )
+        .await
     }
 
     /// Melt Quote [NUT-05]
@@ -356,7 +322,7 @@ impl MintConnector for HttpClient {
 
         #[cfg(not(feature = "auth"))]
         let auth_token = None;
-        self.core.http_post(url, auth_token, &request).await
+        self.transport.http_post(url, auth_token, &request).await
     }
 
     /// Melt Quote Status
@@ -376,7 +342,7 @@ impl MintConnector for HttpClient {
 
         #[cfg(not(feature = "auth"))]
         let auth_token = None;
-        self.core.http_get(url, auth_token).await
+        self.transport.http_get(url, auth_token).await
     }
 
     /// Melt [NUT-05]
@@ -386,7 +352,6 @@ impl MintConnector for HttpClient {
         &self,
         request: MeltRequest<String>,
     ) -> Result<MeltQuoteBolt11Response<String>, Error> {
-        let url = self.mint_url.join_paths(&["v1", "melt", "bolt11"])?;
         #[cfg(feature = "auth")]
         let auth_token = self
             .get_auth_token(Method::Post, RoutePath::MeltBolt11)
@@ -394,25 +359,54 @@ impl MintConnector for HttpClient {
 
         #[cfg(not(feature = "auth"))]
         let auth_token = None;
-        self.core.http_post(url, auth_token, &request).await
+
+        self.retriable_http_request(
+            nut19::Method::Post,
+            nut19::Path::MeltBolt11,
+            auth_token,
+            &request,
+        )
+        .await
     }
 
     /// Swap Token [NUT-03]
     #[instrument(skip(self, swap_request), fields(mint_url = %self.mint_url))]
     async fn post_swap(&self, swap_request: SwapRequest) -> Result<SwapResponse, Error> {
-        let url = self.mint_url.join_paths(&["v1", "swap"])?;
         #[cfg(feature = "auth")]
         let auth_token = self.get_auth_token(Method::Post, RoutePath::Swap).await?;
 
         #[cfg(not(feature = "auth"))]
         let auth_token = None;
-        self.core.http_post(url, auth_token, &swap_request).await
+
+        self.retriable_http_request(
+            nut19::Method::Post,
+            nut19::Path::Swap,
+            auth_token,
+            &swap_request,
+        )
+        .await
     }
 
     /// Helper to get mint info
     async fn get_mint_info(&self) -> Result<MintInfo, Error> {
         let url = self.mint_url.join_paths(&["v1", "info"])?;
-        self.core.http_get(url, None).await
+        let transport = self.transport.clone();
+        let info: MintInfo = transport.http_get(url, None).await?;
+
+        if let Ok(mut cache_support) = self.cache_support.write() {
+            *cache_support = (
+                info.nuts.nut19.ttl.unwrap_or(300),
+                info.nuts
+                    .nut19
+                    .cached_endpoints
+                    .clone()
+                    .into_iter()
+                    .map(|cached_endpoint| (cached_endpoint.method, cached_endpoint.path))
+                    .collect(),
+            );
+        }
+
+        Ok(info)
     }
 
     #[cfg(feature = "auth")]
@@ -439,7 +433,7 @@ impl MintConnector for HttpClient {
 
         #[cfg(not(feature = "auth"))]
         let auth_token = None;
-        self.core.http_post(url, auth_token, &request).await
+        self.transport.http_post(url, auth_token, &request).await
     }
 
     /// Restore request [NUT-13]
@@ -453,38 +447,148 @@ impl MintConnector for HttpClient {
 
         #[cfg(not(feature = "auth"))]
         let auth_token = None;
-        self.core.http_post(url, auth_token, &request).await
+        self.transport.http_post(url, auth_token, &request).await
+    }
+
+    /// Mint Quote Bolt12 [NUT-23]
+    #[instrument(skip(self), fields(mint_url = %self.mint_url))]
+    async fn post_mint_bolt12_quote(
+        &self,
+        request: MintQuoteBolt12Request,
+    ) -> Result<MintQuoteBolt12Response<String>, Error> {
+        let url = self
+            .mint_url
+            .join_paths(&["v1", "mint", "quote", "bolt12"])?;
+
+        #[cfg(feature = "auth")]
+        let auth_token = self
+            .get_auth_token(Method::Post, RoutePath::MintQuoteBolt12)
+            .await?;
+
+        #[cfg(not(feature = "auth"))]
+        let auth_token = None;
+
+        self.transport.http_post(url, auth_token, &request).await
+    }
+
+    /// Mint Quote Bolt12 status
+    #[instrument(skip(self), fields(mint_url = %self.mint_url))]
+    async fn get_mint_quote_bolt12_status(
+        &self,
+        quote_id: &str,
+    ) -> Result<MintQuoteBolt12Response<String>, Error> {
+        let url = self
+            .mint_url
+            .join_paths(&["v1", "mint", "quote", "bolt12", quote_id])?;
+
+        #[cfg(feature = "auth")]
+        let auth_token = self
+            .get_auth_token(Method::Get, RoutePath::MintQuoteBolt12)
+            .await?;
+
+        #[cfg(not(feature = "auth"))]
+        let auth_token = None;
+        self.transport.http_get(url, auth_token).await
+    }
+
+    /// Melt Quote Bolt12 [NUT-23]
+    #[instrument(skip(self, request), fields(mint_url = %self.mint_url))]
+    async fn post_melt_bolt12_quote(
+        &self,
+        request: MeltQuoteBolt12Request,
+    ) -> Result<MeltQuoteBolt11Response<String>, Error> {
+        let url = self
+            .mint_url
+            .join_paths(&["v1", "melt", "quote", "bolt12"])?;
+        #[cfg(feature = "auth")]
+        let auth_token = self
+            .get_auth_token(Method::Post, RoutePath::MeltQuoteBolt12)
+            .await?;
+
+        #[cfg(not(feature = "auth"))]
+        let auth_token = None;
+        self.transport.http_post(url, auth_token, &request).await
+    }
+
+    /// Melt Quote Bolt12 Status [NUT-23]
+    #[instrument(skip(self), fields(mint_url = %self.mint_url))]
+    async fn get_melt_bolt12_quote_status(
+        &self,
+        quote_id: &str,
+    ) -> Result<MeltQuoteBolt11Response<String>, Error> {
+        let url = self
+            .mint_url
+            .join_paths(&["v1", "melt", "quote", "bolt12", quote_id])?;
+
+        #[cfg(feature = "auth")]
+        let auth_token = self
+            .get_auth_token(Method::Get, RoutePath::MeltQuoteBolt12)
+            .await?;
+
+        #[cfg(not(feature = "auth"))]
+        let auth_token = None;
+        self.transport.http_get(url, auth_token).await
+    }
+
+    /// Melt Bolt12 [NUT-23]
+    #[instrument(skip(self, request), fields(mint_url = %self.mint_url))]
+    async fn post_melt_bolt12(
+        &self,
+        request: MeltRequest<String>,
+    ) -> Result<MeltQuoteBolt11Response<String>, Error> {
+        #[cfg(feature = "auth")]
+        let auth_token = self
+            .get_auth_token(Method::Post, RoutePath::MeltBolt12)
+            .await?;
+
+        #[cfg(not(feature = "auth"))]
+        let auth_token = None;
+        self.retriable_http_request(
+            nut19::Method::Post,
+            nut19::Path::MeltBolt12,
+            auth_token,
+            &request,
+        )
+        .await
     }
 }
 
 /// Http Client
 #[derive(Debug, Clone)]
 #[cfg(feature = "auth")]
-pub struct AuthHttpClient {
-    core: HttpClientCore,
+pub struct AuthHttpClient<T>
+where
+    T: Transport + Send + Sync + 'static,
+{
+    transport: Arc<T>,
     mint_url: MintUrl,
     cat: Arc<RwLock<AuthToken>>,
 }
 
 #[cfg(feature = "auth")]
-impl AuthHttpClient {
+impl<T> AuthHttpClient<T>
+where
+    T: Transport + Send + Sync + 'static,
+{
     /// Create new [`AuthHttpClient`]
-    pub fn new(mint_url: MintUrl, cat: Option<AuthToken>) -> Result<Self, Error> {
-        let core = HttpClientCore::new(&mint_url)?;
-        Ok(Self {
-            core,
+    pub fn new(mint_url: MintUrl, cat: Option<AuthToken>) -> Self {
+        Self {
+            transport: T::default().into(),
             mint_url,
             cat: Arc::new(RwLock::new(
                 cat.unwrap_or(AuthToken::ClearAuth("".to_string())),
             )),
-        })
+        }
     }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg(feature = "auth")]
-impl AuthMintConnector for AuthHttpClient {
+impl<T> AuthMintConnector for AuthHttpClient<T>
+where
+    T: Transport + Send + Sync + 'static,
+{
     async fn get_auth_token(&self) -> Result<AuthToken, Error> {
         Ok(self.cat.read().await.clone())
     }
@@ -497,7 +601,7 @@ impl AuthMintConnector for AuthHttpClient {
     /// Get Mint Info [NUT-06]
     async fn get_mint_info(&self) -> Result<MintInfo, Error> {
         let url = self.mint_url.join_paths(&["v1", "info"])?;
-        let mint_info: MintInfo = self.core.http_get::<_, MintInfo>(url, None).await?;
+        let mint_info: MintInfo = self.transport.http_get::<MintInfo>(url, None).await?;
 
         Ok(mint_info)
     }
@@ -509,7 +613,7 @@ impl AuthMintConnector for AuthHttpClient {
             self.mint_url
                 .join_paths(&["v1", "auth", "blind", "keys", &keyset_id.to_string()])?;
 
-        let mut keys_response = self.core.http_get::<_, KeysResponse>(url, None).await?;
+        let mut keys_response = self.transport.http_get::<KeysResponse>(url, None).await?;
 
         let keyset = keys_response
             .keysets
@@ -527,14 +631,14 @@ impl AuthMintConnector for AuthHttpClient {
             .mint_url
             .join_paths(&["v1", "auth", "blind", "keysets"])?;
 
-        self.core.http_get(url, None).await
+        self.transport.http_get(url, None).await
     }
 
     /// Mint Tokens [NUT-22]
     #[instrument(skip(self, request), fields(mint_url = %self.mint_url))]
     async fn post_mint_blind_auth(&self, request: MintAuthRequest) -> Result<MintResponse, Error> {
         let url = self.mint_url.join_paths(&["v1", "auth", "blind", "mint"])?;
-        self.core
+        self.transport
             .http_post(url, Some(self.cat.read().await.clone()), &request)
             .await
     }
