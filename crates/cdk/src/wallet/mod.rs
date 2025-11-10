@@ -66,8 +66,10 @@ pub use mint_connector::transport::Transport as HttpTransport;
 #[cfg(feature = "auth")]
 pub use mint_connector::AuthHttpClient;
 pub use mint_connector::{HttpClient, MintConnector};
-#[cfg(feature = "tor")]
-pub use mint_connector::{TorPolicy, TorConfig, HttpClientTor, set_tor_config, get_tor_config, should_use_tor_for_url, is_tor_ready};
+#[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
+pub use mint_connector::TorHttpClient;
+#[cfg(all(feature = "tor", feature = "auth", not(target_arch = "wasm32")))]
+pub use mint_connector::TorAuthHttpClient;
 pub use multi_mint_wallet::{MultiMintReceiveOptions, MultiMintSendOptions, MultiMintWallet};
 pub use receive::ReceiveOptions;
 pub use send::{PreparedSend, SendMemo, SendOptions};

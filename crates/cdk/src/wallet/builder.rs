@@ -17,8 +17,10 @@ use crate::wallet::auth::AuthWallet;
 use crate::wallet::{MintConnector, SubscriptionManager, Wallet};
 #[cfg(not(feature = "tor"))]
 use crate::wallet::HttpClient;
-#[cfg(feature = "tor")]
-use crate::wallet::mint_connector::HttpClientTor;
+#[cfg(all(feature = "tor", feature = "auth", not(target_arch = "wasm32")))]
+use crate::wallet::mint_connector::TorAuthHttpClient;
+#[cfg(all(feature = "tor", not(feature = "auth"), not(target_arch = "wasm32")))]
+use crate::wallet::mint_connector::TorHttpClient;
 
 /// Builder for creating a new [`Wallet`]
 #[derive(Debug)]
@@ -159,20 +161,19 @@ impl WalletBuilder {
                 tracing::info!("WalletBuilder: mint_url={}, is_onion={}", url_str, is_onion);
                 
                 // Feature combination: tor + auth
-                // Always use HttpClientTor to support dynamic Tor policy changes
-                #[cfg(all(feature = "tor", feature = "auth"))]
+                #[cfg(all(feature = "tor", feature = "auth", not(target_arch = "wasm32")))]
                 {
-                    tracing::info!("WalletBuilder: Creating HttpClientTor (with auth) for {} - supports dynamic Tor policy", url_str);
-                    Arc::new(HttpClientTor::new(mint_url.clone(), self.auth_wallet.clone())?)
+                    tracing::info!("WalletBuilder: Creating TorAuthHttpClient for {}", url_str);
+                    // Auth token will be set by AuthWallet after creation
+                    Arc::new(TorAuthHttpClient::new(mint_url.clone(), None))
                         as Arc<dyn MintConnector + Send + Sync>
                 }
                 
                 // Feature combination: tor + no auth
-                // Always use HttpClientTor to support dynamic Tor policy changes
-                #[cfg(all(feature = "tor", not(feature = "auth")))]
+                #[cfg(all(feature = "tor", not(feature = "auth"), not(target_arch = "wasm32")))]
                 {
-                    tracing::info!("WalletBuilder: Creating HttpClientTor (no auth) for {} - supports dynamic Tor policy", url_str);
-                    Arc::new(HttpClientTor::new(mint_url.clone())?)
+                    tracing::info!("WalletBuilder: Creating TorHttpClient for {}", url_str);
+                    Arc::new(TorHttpClient::new(mint_url.clone()))
                         as Arc<dyn MintConnector + Send + Sync>
                 }
                 

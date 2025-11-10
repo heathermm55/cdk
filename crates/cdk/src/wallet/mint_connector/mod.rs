@@ -17,8 +17,6 @@ use crate::wallet::AuthWallet;
 
 pub mod http_client;
 pub mod transport;
-#[cfg(feature = "tor")]
-mod http_client_tor;
 
 /// Auth HTTP Client with async transport
 #[cfg(feature = "auth")]
@@ -28,11 +26,9 @@ pub type HttpClient = http_client::HttpClient<transport::Async>;
 /// Tor Http Client with async transport (only when `tor` feature is enabled and not on wasm32)
 #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
 pub type TorHttpClient = http_client::HttpClient<transport::tor_transport::TorAsync>;
-#[cfg(feature = "tor")]
-pub use http_client_tor::{
-    TorPolicy, TorConfig, HttpClientTor,
-    set_tor_config, get_tor_config, should_use_tor_for_url, is_tor_ready
-};
+/// Tor Auth Http Client with async transport (only when `tor` and `auth` features are enabled and not on wasm32)
+#[cfg(all(feature = "tor", feature = "auth", not(target_arch = "wasm32")))]
+pub type TorAuthHttpClient = http_client::AuthHttpClient<transport::tor_transport::TorAsync>;
 
 /// Interface that connects a wallet to a mint. Typically represents an [HttpClient].
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
