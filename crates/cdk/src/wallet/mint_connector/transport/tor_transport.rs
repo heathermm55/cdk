@@ -2,6 +2,7 @@
 use std::sync::Arc;
 
 use arti_client::{TorClient, TorClientConfig};
+use arti_client::config::CfgPath;
 use arti_hyper::ArtiHttpConnector;
 use async_trait::async_trait;
 use cdk_common::AuthToken;
@@ -79,9 +80,46 @@ impl TorAsync {
         let pool_ref = self
             .pool
             .get_or_try_init(|| async move {
-                let base = TorClient::create_bootstrapped(TorClientConfig::default())
+                // Build TorClientConfig with proper data directories
+                // Environment variables ARTI_CACHE and ARTI_LOCAL_DATA should be set by the application
+                // (e.g., in init_multi_mint_wallet) to use the app's data directory.
+                // If not set, fall back to temp directory (for compatibility).
+                let mut config_builder = TorClientConfig::builder();
+                
+                // Check if environment variables are set (preferred), otherwise use temp directory as fallback
+                let cache_dir = std::env::var("ARTI_CACHE")
+                    .unwrap_or_else(|_| {
+                        let fallback = std::env::temp_dir().join("arti_cache").to_string_lossy().to_string();
+                        tracing::warn!("ARTI_CACHE not set, using fallback: {}", fallback);
+                        fallback
+                    });
+                let state_dir = std::env::var("ARTI_LOCAL_DATA")
+                    .unwrap_or_else(|_| {
+                        let fallback = std::env::temp_dir().join("arti_data").to_string_lossy().to_string();
+                        tracing::warn!("ARTI_LOCAL_DATA not set, using fallback: {}", fallback);
+                        fallback
+                    });
+                
+                // Create directories if they don't exist
+                if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+                    tracing::warn!("Failed to create ARTI_CACHE directory {}: {}", cache_dir, e);
+                }
+                if let Err(e) = std::fs::create_dir_all(&state_dir) {
+                    tracing::warn!("Failed to create ARTI_LOCAL_DATA directory {}: {}", state_dir, e);
+                }
+                
+                // Use CfgPath::new() to create path configuration
+                config_builder
+                    .storage()
+                    .cache_dir(CfgPath::new(cache_dir))
+                    .state_dir(CfgPath::new(state_dir));
+                
+                let config = config_builder.build()
+                    .map_err(|e| Error::Custom(format!("Failed to build TorClientConfig: {}", e)))?;
+                
+                let base = TorClient::create_bootstrapped(config)
                     .await
-                    .map_err(|e| Error::Custom(e.to_string()))?;
+                    .map_err(|e| Error::Custom(format!("Failed to bootstrap Tor client: {}", e)))?;
                 let mut clients = Vec::with_capacity(size);
                 for _ in 0..size {
                     clients.push(base.isolated_client());

@@ -34,8 +34,6 @@ use crate::OidcClient;
 
 #[cfg(feature = "auth")]
 mod auth;
-#[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
-pub use mint_connector::TorHttpClient;
 mod balance;
 mod builder;
 mod issue;

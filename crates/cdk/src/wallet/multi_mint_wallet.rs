@@ -441,14 +441,29 @@ impl MultiMintWallet {
                     .client(client)
                     .build()?
             } else {
-                // Create wallet with default client
-                Wallet::new(
-                    &mint_url.to_string(),
-                    self.unit.clone(),
-                    self.localstore.clone(),
-                    self.seed,
-                    Some(target_proof_count),
-                )?
+                // Create wallet with default client using WalletBuilder
+                // Auto-detect Tor usage: use Tor for .onion addresses when tor feature is enabled
+                let url_str = mint_url.to_string();
+                let is_onion = url_str.contains(".onion");
+                
+                #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
+                let builder = WalletBuilder::new()
+                    .mint_url(mint_url.clone())
+                    .unit(self.unit.clone())
+                    .localstore(self.localstore.clone())
+                    .seed(self.seed)
+                    .target_proof_count(target_proof_count)
+                    .use_tor(is_onion); // Auto-use Tor for .onion addresses
+                
+                #[cfg(not(all(feature = "tor", not(target_arch = "wasm32"))))]
+                let builder = WalletBuilder::new()
+                    .mint_url(mint_url.clone())
+                    .unit(self.unit.clone())
+                    .localstore(self.localstore.clone())
+                    .seed(self.seed)
+                    .target_proof_count(target_proof_count);
+                
+                builder.build()?
             }
 
             #[cfg(not(all(feature = "tor", not(target_arch = "wasm32"))))]
