@@ -356,7 +356,7 @@ impl MultiMintWallet {
     /// 3. Default HttpClient
     async fn create_wallet_with_config(
         &self,
-        mint_url: MintUrl,
+        mut mint_url: MintUrl,
         config: Option<&WalletConfig>,
     ) -> Result<Wallet, Error> {
         // Convert https:// to http:// for .onion addresses
