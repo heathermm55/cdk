@@ -1,5 +1,6 @@
 #[cfg(feature = "auth")]
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use cdk_common::database;
@@ -152,10 +153,21 @@ impl WalletBuilder {
     }
 
     /// Build the wallet
-    pub fn build(self) -> Result<Wallet, Error> {
-        let mint_url = self
+    pub fn build(mut self) -> Result<Wallet, Error> {
+        let mut mint_url = self
             .mint_url
             .ok_or(Error::Custom("Mint url required".to_string()))?;
+        
+        // Convert https:// to http:// for .onion addresses
+        // .onion addresses should use HTTP, not HTTPS
+        let url_str = mint_url.to_string();
+        if url_str.contains(".onion") && url_str.starts_with("https://") {
+            let corrected_url = url_str.replace("https://", "http://");
+            mint_url = MintUrl::from_str(&corrected_url)
+                .map_err(|e| Error::Custom(format!("Failed to convert onion URL: {}", e)))?;
+            self.mint_url = Some(mint_url.clone());
+        }
+        
         let unit = self
             .unit
             .ok_or(Error::Custom("Unit required".to_string()))?;

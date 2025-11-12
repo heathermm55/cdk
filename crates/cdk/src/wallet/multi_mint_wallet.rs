@@ -359,6 +359,14 @@ impl MultiMintWallet {
         mint_url: MintUrl,
         config: Option<&WalletConfig>,
     ) -> Result<Wallet, Error> {
+        // Convert https:// to http:// for .onion addresses
+        // .onion addresses should use HTTP, not HTTPS
+        let url_str = mint_url.to_string();
+        if url_str.contains(".onion") && url_str.starts_with("https://") {
+            let corrected_url = url_str.replace("https://", "http://");
+            mint_url = MintUrl::from_str(&corrected_url)
+                .map_err(|e| Error::Custom(format!("Failed to convert onion URL: {}", e)))?;
+        }
         // Check if custom connector is provided in config
         if let Some(cfg) = config {
             if let Some(custom_connector) = &cfg.mint_connector {

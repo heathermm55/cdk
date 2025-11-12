@@ -1,8 +1,9 @@
 ///! Tor transport implementation (non-wasm32 only)
+use std::error::Error as StdError;
 use std::sync::Arc;
 
-use arti_client::{TorClient, TorClientConfig};
-use arti_client::config::CfgPath;
+use arti_client::{TorClient, TorClientConfig, StreamPrefs};
+use arti_client::config::{CfgPath, BoolOrAuto};
 use arti_hyper::ArtiHttpConnector;
 use async_trait::async_trait;
 use cdk_common::AuthToken;
@@ -114,15 +115,62 @@ impl TorAsync {
                     .cache_dir(CfgPath::new(cache_dir))
                     .state_dir(CfgPath::new(state_dir));
                 
+                // Configure circuit timing for better reliability on slow networks
+                // Increase timeout and retries for Android/mobile environments
+                // Mobile networks and Android emulators often have slower connections
+                let circuit_timeout_secs = std::env::var("ARTI_CIRCUIT_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(180); // Default: 180 seconds (3 minutes) - increased for mobile
+                let circuit_max_retries = std::env::var("ARTI_CIRCUIT_MAX_RETRIES")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(32); // Default: 32 retries - increased for unreliable networks
+                
+                config_builder
+                    .circuit_timing()
+                    .request_timeout(std::time::Duration::from_secs(circuit_timeout_secs))
+                    .request_max_retries(circuit_max_retries);
+                
+                // Configure stream timeouts for better reliability
+                // Increased for mobile networks and Android emulators
+                let stream_connect_timeout_secs = std::env::var("ARTI_STREAM_CONNECT_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(60); // Default: 60 seconds - increased for mobile
+                
+                config_builder
+                    .stream_timeouts()
+                    .connect_timeout(std::time::Duration::from_secs(stream_connect_timeout_secs));
+                
+                // Enable onion service connections in configuration
+                config_builder.address_filter().allow_onion_addrs(true);
+                
                 let config = config_builder.build()
                     .map_err(|e| Error::Custom(format!("Failed to build TorClientConfig: {}", e)))?;
                 
-                let base = TorClient::create_bootstrapped(config)
+                let mut base = TorClient::create_bootstrapped(config)
                     .await
                     .map_err(|e| Error::Custom(format!("Failed to bootstrap Tor client: {}", e)))?;
+                
+                // Set default stream preferences to enable onion service connections
+                // Use IPv4 preferred to avoid IPv6 connection failures on mobile networks
+                let mut stream_prefs = StreamPrefs::new();
+                stream_prefs
+                    .connect_to_onion_services(BoolOrAuto::Explicit(true))
+                    .ipv4_preferred(); // Prefer IPv4 to avoid IPv6 connection issues
+                base.set_stream_prefs(stream_prefs);
+                
                 let mut clients = Vec::with_capacity(size);
                 for _ in 0..size {
-                    clients.push(base.isolated_client());
+                    let mut isolated = base.isolated_client();
+                    // Set stream prefs for isolated clients as well
+                    let mut isolated_prefs = StreamPrefs::new();
+                    isolated_prefs
+                        .connect_to_onion_services(BoolOrAuto::Explicit(true))
+                        .ipv4_preferred(); // Prefer IPv4 to avoid IPv6 connection issues
+                    isolated.set_stream_prefs(isolated_prefs);
+                    clients.push(isolated);
                 }
                 Ok::<Vec<TorClient<tor_rtcompat::PreferredRuntime>>, Error>(clients)
             })
@@ -236,7 +284,51 @@ impl TorAsync {
         let resp = client
             .request(req)
             .await
-            .map_err(|e| Error::HttpError(None, e.to_string()))?;
+            .map_err(|e| {
+                // Extract detailed error information for better diagnostics
+                let error_msg = format!("{}", e);
+                
+                // Try to extract source chain for more context
+                let mut source_chain = error_msg.clone();
+                let mut current_source = StdError::source(&e);
+                let mut source_count = 0;
+                while let Some(source) = current_source {
+                    if source_count < 3 { // Limit depth to avoid too long messages
+                        source_chain.push_str(&format!(" -> {}", source));
+                        source_count += 1;
+                    } else {
+                        source_chain.push_str(" -> ...");
+                        break;
+                    }
+                    current_source = StdError::source(source);
+                }
+                
+                // Check if this is a Tor-related error
+                let is_tor_error = error_msg.contains("Tor connection failed") || 
+                                   error_msg.contains("circuit") || 
+                                   error_msg.contains("channel") ||
+                                   error_msg.contains("timeout") ||
+                                   error_msg.contains("No route to host");
+                
+                let detailed_msg = if is_tor_error {
+                    tracing::warn!(
+                        "Tor connection error for {}: {}",
+                        url,
+                        source_chain
+                    );
+                    format!(
+                        "Tor connection failed: {}. Possible causes: network connectivity issues, \
+                        firewall blocking, Tor guard node unavailability, or timeout. \
+                        Check network connection and ensure Tor can establish circuits. \
+                        You may want to increase timeout settings via environment variables: \
+                        ARTI_CIRCUIT_TIMEOUT_SECS, ARTI_CIRCUIT_MAX_RETRIES, ARTI_STREAM_CONNECT_TIMEOUT_SECS",
+                        source_chain
+                    )
+                } else {
+                    source_chain
+                };
+                Error::HttpError(None, detailed_msg)
+            })?;
 
         let status = resp.status().as_u16();
         let bytes = hyper::body::to_bytes(resp.into_body())
