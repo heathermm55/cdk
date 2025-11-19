@@ -142,7 +142,7 @@ impl MultiMintWallet {
                 cdk::mint_url::MintUrl::from_str("https://invalid.mint").unwrap()
             })
         });
-        self.inner.remove_mint(&cdk_mint_url).await;
+        let _ = self.inner.remove_mint(&cdk_mint_url).await;
     }
 
     /// Check if mint is in wallet

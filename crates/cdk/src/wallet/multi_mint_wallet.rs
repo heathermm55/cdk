@@ -343,9 +343,18 @@ impl MultiMintWallet {
 
     /// Remove mint from MultiMintWallet
     #[instrument(skip(self))]
-    pub async fn remove_mint(&self, mint_url: &MintUrl) {
+    pub async fn remove_mint(&self, mint_url: &MintUrl) -> Result<(), Error> {
+        // Remove from database first
+        self.localstore
+            .remove_mint(mint_url.clone())
+            .await
+            .map_err(Error::Database)?;
+        
+        // Then remove from memory
         let mut wallets = self.wallets.write().await;
         wallets.remove(mint_url);
+        
+        Ok(())
     }
 
     /// Internal: Create wallet with optional custom configuration
@@ -1207,7 +1216,7 @@ impl MultiMintWallet {
                 // If we added the mint temporarily for transfer only, remove it before returning error
                 if !is_trusted && opts.transfer_to_mint.is_some() {
                     drop(wallets);
-                    self.remove_mint(&mint_url).await;
+                    let _ = self.remove_mint(&mint_url).await;
                 }
                 return Err(err);
             }
@@ -1221,7 +1230,7 @@ impl MultiMintWallet {
                 // Ensure target mint exists and is trusted
                 if !self.has_mint(&target_mint).await {
                     // Clean up untrusted mint if we're only using it for transfer
-                    self.remove_mint(&mint_url).await;
+                    let _ = self.remove_mint(&mint_url).await;
                     return Err(Error::UnknownMint {
                         mint_url: target_mint.to_string(),
                     });
@@ -1255,7 +1264,7 @@ impl MultiMintWallet {
                 }
 
                 // Remove the untrusted mint after transfer
-                self.remove_mint(&mint_url).await;
+                let _ = self.remove_mint(&mint_url).await;
             }
         }
         // Note: If allow_untrusted is true but no transfer is requested,
